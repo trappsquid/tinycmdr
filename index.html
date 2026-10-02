@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tinycmdr — an autonomous ops agent for self-hosted models</title>
+<meta name="description" content="tinycmdr is an autonomous ops agent for local and self-hosted LLMs: one Python file, three dependencies, any OpenAI-compatible endpoint (llama.cpp, vLLM, SGLang, Ollama or a cloud API). Windows, Linux and macOS.">
+<link rel="canonical" href="https://trappsquid.github.io/tinycmdr/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="tinycmdr — an autonomous ops agent for self-hosted models">
+<meta property="og:description" content="One Python file, three dependencies, any OpenAI-compatible endpoint. Stable, cache-friendly prompt prefix; built so a confused model cannot wedge your inference slot.">
+<meta property="og:url" content="https://trappsquid.github.io/tinycmdr/">
+<style>
+  :root { color-scheme: light dark; --fg:#1b1f24; --muted:#59636e; --line:#d8dee4; --bg:#fff; --code:#f6f8fa; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6edf3; --muted:#9198a1; --line:#30363d; --bg:#0d1117; --code:#161b22; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  main { max-width: 780px; margin: 0 auto; padding: 56px 20px 80px; }
+  h1 { font-size: 2.4rem; margin: 0 0 .2em; letter-spacing: -.02em; }
+  h2 { font-size: 1.15rem; margin: 2.2em 0 .6em; }
+  p, li { color: var(--fg); }
+  .tagline { font-size: 1.15rem; color: var(--muted); margin: 0 0 .4em; }
+  .meta { color: var(--muted); font-size: .92rem; margin: 0 0 2em; }
+  a { color: #0969da; text-decoration: none; }
+  @media (prefers-color-scheme: dark) { a { color:#4493f8; } }
+  a:hover { text-decoration: underline; }
+  pre { background: var(--code); border:1px solid var(--line); border-radius:8px;
+        padding: 14px 16px; overflow:auto; font-size: .88rem; }
+  code { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  table { border-collapse: collapse; width:100%; font-size:.92rem; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight:600; }
+  .badges a { margin-right: 10px; font-size:.85rem; color:var(--muted); }
+  footer { margin-top: 3.5em; padding-top: 1.2em; border-top:1px solid var(--line);
+           color: var(--muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>tinycmdr</h1>
+  <p class="tagline">An autonomous ops agent for self-hosted models.</p>
+  <p class="meta">One Python file · three dependencies · any OpenAI-compatible endpoint —
+     llama.cpp, vLLM, SGLang, Ollama, or a cloud API.</p>
+  <p class="badges">
+    <a href="https://github.com/trappsquid/tinycmdr">GitHub</a>
+    <a href="https://github.com/trappsquid/tinycmdr/releases/latest">Latest release</a>
+    <a href="https://github.com/trappsquid/tinycmdr/blob/main/LICENSE">MIT license</a>
+  </p>
+
+  <p>tinycmdr runs <strong>on the machine it manages</strong>. You send it a task; it does the
+     work with real tools (<code>shell</code>, <code>execute_code</code>, <code>edit_file</code>,
+     <code>fetch_url</code>, …), narrates what it is doing, and keeps its state in plain files
+     beside itself. It is built for small and local models: the prompt is a stable,
+     cache-friendly prefix, and the runtime is built so a confused model cannot wedge your
+     inference slot.</p>
+
+  <p>Reach it from a <strong>terminal</strong> or <strong>chat</strong> (Mattermost, Telegram) —
+     one process, one vocabulary, the same conversations either way.</p>
+
+  <h2>Install</h2>
+  <p><strong>Windows</strong> — PowerShell, no administrator rights:</p>
+  <pre><code>irm https://github.com/trappsquid/tinycmdr/releases/latest/download/install.ps1 | iex</code></pre>
+  <p><strong>Linux and macOS</strong> — one line; it asks a few questions and writes nothing
+     until you confirm:</p>
+  <pre><code>curl -fsSL https://github.com/trappsquid/tinycmdr/releases/latest/download/install.sh | bash</code></pre>
+  <p>Either installer fetches the newest build, creates its own private Python environment,
+     and starts the agent with the machine. Needs <strong>Python 3.10–3.12</strong>. A Linux
+     <em>system</em> install and a macOS install with <code>sudo</code> ask for root; a Windows
+     install and a Linux <em>user</em> install never do.</p>
+
+  <h2>Start it</h2>
+  <pre><code>tinycmdr setup        # once: endpoint, chat gateways, search consent
+tinycmdr              # the session as a full-screen terminal app
+tinycmdr --cli        # the same session, inline cards in the scrollback
+tinycmdr --once "…"   # one task, then exit</code></pre>
+
+  <h2>Use it</h2>
+  <p>The same verbs work in a shell (<code>tinycmdr &lt;verb&gt;</code>), in the interactive CLI
+     (<code>/tinycmdr &lt;verb&gt;</code>), and in chat:</p>
+  <table>
+    <tr><th>Verb</th><th>What it does</th></tr>
+    <tr><td><code>status</code></td><td>version, folder, model, endpoint, context, log, instance</td></tr>
+    <tr><td><code>doctor</code></td><td>check this install and name what is wrong (exit 1 when something is)</td></tr>
+    <tr><td><code>health</code></td><td>one line and an exit code, no network — for scripts</td></tr>
+    <tr><td><code>model</code></td><td>pick a model from a list you move through; a dead endpoint offers the wizard</td></tr>
+    <tr><td><code>logs</code> · <code>version</code> · <code>proc</code></td><td>log tail, version, this install's process and lock state</td></tr>
+    <tr><td><code>update</code></td><td>pull the published build</td></tr>
+    <tr><td><code>restart</code></td><td>restart through this host's own door (launchd, systemd, Task Scheduler)</td></tr>
+  </table>
+
+  <h2>Extend it</h2>
+  <p><strong>Prose skills.</strong> Drop a runbook folder into <code>skills/</code> and it is live
+     on the next message.</p>
+  <p><strong>Custom tools.</strong> Drop a <code>.py</code> into <code>tools/</code> and it is
+     callable from the next call — listed in the prompt by name and shelf.</p>
+
+  <h2>Update and remove</h2>
+  <pre><code>tinycmdr update      # pull the published build
+tinycmdr restart     # start running it</code></pre>
+  <p>Removal is one command per platform; see the
+     <a href="https://github.com/trappsquid/tinycmdr#remove-it">README</a>.</p>
+
+  <footer>
+    MIT — free and open source for personal and enterprise hardware.<br>
+    Source, releases and full documentation:
+    <a href="https://github.com/trappsquid/tinycmdr">github.com/trappsquid/tinycmdr</a>
+  </footer>
+</main>
+</body>
+</html>
