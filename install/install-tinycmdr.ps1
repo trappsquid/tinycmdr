@@ -1,0 +1,2179 @@
+<#
+    tinycmdr installer - copies the bot into THIS USER's profile and makes it
+    available. NO ADMINISTRATOR RIGHTS ARE NEEDED for a normal install.
+
+    Double-click ..\install-tinycmdr.cmd, or run this file from a shell:
+
+        powershell -ExecutionPolicy Bypass -File .\install\install-tinycmdr.ps1
+
+    With no arguments it:
+      * installs into %USERPROFILE%\tinycmdr (your own folder, nothing shared)
+      * finds Python 3.10-3.12, and DOWNLOADS AND INSTALLS Python 3.12 if the
+        machine has none (winget, then the python.org installer) - no manual step
+      * builds the install's own virtual environment and installs the
+        dependencies into it (requests, mmpy_bot, croniter)
+      * uses install\fleet-defaults.json from the package when it is present
+        (a fleet host needs nothing typed in), reuses a bot token from an
+        existing .env, and asks for one only if there is none
+      * starts it at your next logon through a shortcut in your Startup folder
+        (no elevation, no service registration)
+
+    A redo is:
+
+        install-tinycmdr.cmd -Force
+
+    Other things it can do:
+        -AsService         register a Windows scheduled task instead (runs at
+                           BOOT, before you log in - this one DOES need an
+                           elevated shell, because Windows reserves boot-start
+                           tasks for administrators)
+        -InstallDir <d>    install somewhere else
+        -SearchEgress <b>  true|false: may web search send queries OFF this machine?
+                           default false - both built-in providers are third parties,
+                           and a provider on this LAN (a searxng entry) never needs it
+        -WebHost <addr>     page bind: 127.0.0.1 (default) or 0.0.0.0 to reach the
+                           page from other machines on your network
+        -WebPort <p>        the page's port (default 8790)
+        -WebToken <t>       the page's access token (TINYCMDR_WEB_TOKEN): set your
+                            own, or keep the host's own / a minted one
+        -NoWeb              install without the page (the chat lane only)
+        -ForcePython       accept an interpreter NEWER than 3.12 and hope: the pinned
+                           mmpy_bot is the last release that connects on 3.13+
+        -VerifyOnly        is this install working? (no reinstall)
+        -Uninstall [-Force] stop it, remove the folder and the autostart entry
+                           (double-clicking UNINSTALL-WINDOWS.cmd, shipped in the
+                           install folder, does the same to the folder it sits in)
+
+    Exit codes:
+        0  installed and verified
+        1  bad input or missing prerequisite
+        2  install failed (or a removal that could not finish)
+        3  installed, but the model endpoint did not answer (a config gap)
+#>
+[CmdletBinding()]
+param(
+    [string] $InstallDir      = "",              # default: %USERPROFILE%\tinycmdr
+                                                 # (fleet-defaults.json may name one)
+    [string] $TaskName        = "Tinycmdr",
+    [string] $MattermostUrl   = "",              # default: fleet-defaults.json
+    [int]    $MattermostPort  = 443,
+    [string] $MattermostToken = "",              # default: token file, existing .env, then prompt
+    [string] $MattermostTokenFile = "",          # read the token from a file instead
+    [string] $TelegramToken   = "",              # the third door: a Telegram DM
+    [string] $TelegramIds     = "",              # NUMERIC ids, comma or space separated
+                                                 # (message @userinfobot for yours)
+    [string] $SecretsFile     = "",              # .env-style file: TINYCMDR_MM_TOKEN,
+                                                 # TAVILY_API_KEY, ANYSEARCH_API_KEY
+                                                 # (a model key is per bot and is
+                                                 #  ignored here - set it per host)
+    [string] $AllowedUser     = "",              # default: fleet-defaults.json
+    [string] $BotName         = "",              # defaults to this machine's name
+    [string] $ModelBaseUrl    = "",              # default: fleet-defaults.json
+    [string] $Model           = "main",
+    [string] $SearchEgress    = "",              # -SearchEgress true|false: may web search
+                                                 # send queries OFF this machine? "" leaves
+                                                 # this host's own; an off-LAN provider is
+                                                 # refused, not called, while false
+    [string[]] $AddEndpoint   = @(),             # more model endpoints, repeatable:
+                                                 # "<base_url>;<model>;<alias>;<key>" -
+                                                 # tried in order when the primary fails,
+                                                 # and the key lands in .env. (';' and
+                                                 # not '|': a cmd.exe wrapper reads '|'
+                                                 # as a pipe and splits the argument)
+    [string] $Python          = "",              # full path to python.exe if auto-detect fails
+    [switch] $InstallPython,                     # kept for compatibility: installing a
+                                                 # missing Python is now the DEFAULT
+    [switch] $ForcePython,                       # accept an interpreter NEWER than 3.12
+                                                 # and hope: the pinned mmpy_bot is the
+                                                 # last release that connects on 3.13+
+    [switch] $Force,                             # redo: stop what is running, overwrite everything
+    [switch] $AsService,                         # register a boot-start scheduled task
+                                                 # instead of a logon shortcut (needs admin)
+    [switch] $SkipTask,                          # files only: no autostart, no service
+    [switch] $NoStart,
+    [switch] $NoPath,                            # leave the user PATH alone
+    [switch] $NoPause,                           # for scripted runs (the .cmd uses this)
+    [switch] $VerifyOnly,                        # just probe -InstallDir and stop
+    [switch] $Uninstall,                         # remove the task and the folder
+    [string] $WebHost         = "",              # page bind: "" = this machine, 0.0.0.0 = your LAN
+    [int]    $WebPort         = 8790,            # page port (the published default)
+    [string] $WebToken        = "",              # page token: set your own, or keep/mint
+    [switch] $NoWeb,                             # install without the page
+    [switch] $NonInteractive                     # never ask: for scripts and fleet pushes
+                                                 # (a redirected stdin also means "do not ask")
+)
+
+$ErrorActionPreference = "Stop"
+$Source = Split-Path -Parent $PSScriptRoot       # package root (one level above install\)
+
+# --------------------------------------------------------------- asking the user
+# The .cmd wrapper always passes -NoPause, and that flag is only about keeping the window open at
+# the end. Questions are a separate decision: a real console, and not -NonInteractive. Gating them
+# on -NoPause is exactly how a double-click ended up asking nothing.
+# Whether to ASK. A real console means a person is there; -NonInteractive or a
+# redirected stdin means a script (a fleet push must never hang on a question).
+# Note this is deliberately NOT -NoPause: the .cmd wrapper always passes -NoPause
+# to keep its window open, so gating questions on that is exactly how a
+# double-click ended up asking nothing.
+$Ask = (-not $NonInteractive) -and ((-not [Console]::IsInputRedirected) -or $env:TINYCMDR_ASK)
+
+function Read-Secret {
+    # A masked reader that ACCEPTS PASTE: one * per character, backspace works. The bot
+    # token field used Read-Host -AsSecureString, which is blank in some hosts and DROPS a
+    # pasted token in others - the Mattermost field would not take a paste at all. ReadKey()
+    # sees a paste as a burst of keypresses, so it is masked exactly like typing.
+    param([string] $Prompt)
+    if ([Console]::IsInputRedirected) {
+        $sec = Read-Host $Prompt -AsSecureString
+        return [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                   [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+    }
+    Write-Host -NoNewline $Prompt
+    $chars = New-Object System.Collections.Generic.List[char]
+    while ($true) {
+        $k = [Console]::ReadKey($true)
+        if ($k.Key -eq [ConsoleKey]::Enter) { Write-Host ""; return (-join $chars) }
+        if ($k.Key -eq [ConsoleKey]::Escape) { Write-Host ""; return "" }
+        if ($k.Key -eq [ConsoleKey]::Backspace) {
+            if ($chars.Count -gt 0) {
+                $chars.RemoveAt($chars.Count - 1)
+                Write-Host -NoNewline "`b `b"
+            }
+            continue
+        }
+        if ($k.KeyChar -and [int][char]$k.KeyChar -ge 32) {
+            [void]$chars.Add($k.KeyChar)
+            Write-Host -NoNewline "*"
+        }
+    }
+}
+
+function Ask-Text {
+    param([string] $Prompt, [string] $Default = "", [switch] $Secret, [switch] $AllowBlank)
+    # ${Prompt} - a bare "$Prompt:" reads as a scoped variable to PowerShell
+    $shown = if ($Default) { "${Prompt} [$Default]: " } else { "${Prompt}: " }
+    if ($Secret -and -not $Default) { $shown = "${Prompt}: " }
+    while ($true) {
+        if ($Secret) {
+            $val = Read-Secret $shown
+        } else {
+            $val = Read-Host $shown
+        }
+        if ($val -and $val.Trim()) { return $val.Trim() }
+        if ($Default) { return $Default }
+        if ($AllowBlank) { return "" }
+        Write-Host "  (this one is needed - please type something)"
+    }
+}
+
+function Ask-Many {
+    # Any number of them: "1,3" or "1 3" or just Enter for the default. The doors are not
+    # exclusive - a host may take more than one, and a session never takes the lock.
+    param([string] $Title, [string[]] $Options, [string] $Default = "1")
+    Write-Host ""
+    Write-Host $Title
+    for ($i = 0; $i -lt $Options.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i + 1), $Options[$i]) }
+    while ($true) {
+        $a = (Read-Host ("Choose any of 1-{0}, separated by commas (Enter = {1})" -f $Options.Count, $Default)).Trim()
+        if (-not $a) { $a = $Default }
+        $picked = @()
+        $bad = $false
+        foreach ($part in ($a -split "[,\s]+")) {
+            if (-not $part) { continue }
+            $n = 0
+            if ([int]::TryParse($part, [ref] $n) -and $n -ge 1 -and $n -le $Options.Count) { $picked += $n }
+            else { $bad = $true; break }
+        }
+        if (-not $bad -and $picked.Count) { return ($picked | Sort-Object -Unique) }
+        Write-Host "  Please use the numbers from the list, like 1 or 1,3."
+    }
+}
+
+function Ask-Yes {
+    param([string] $Prompt, [bool] $Default = $true)
+    $d = if ($Default) { "Y/n" } else { "y/N" }
+    while ($true) {
+        $a = (Read-Host "$Prompt [$d]").Trim().ToLower()
+        if (-not $a) { return $Default }
+        if ($a -in @("y", "yes")) { return $true }
+        if ($a -in @("n", "no")) { return $false }
+        Write-Host "  Please answer y or n."
+    }
+}
+
+function Ask-Choose {
+    # The local/cloud question every model endpoint is asked now. Local needs no key;
+    # cloud does, and the answer decides whether a key is asked for and carried on the
+    # bearer probe. Returns "1" or "2" so the caller never re-parses prose.
+    param([string] $Prompt, [string] $Default = "1", [string] $Label1, [string] $Label2)
+    Write-Host "    $Prompt"
+    Write-Host "      1) $Label1"
+    Write-Host "      2) $Label2"
+    while ($true) {
+        $a = (Read-Host "    choice [$Default]").Trim().ToLower()
+        if (-not $a) { return $Default }
+        if ($a -in @("1", "l", "local", "lan")) { return "1" }
+        if ($a -in @("2", "c", "cloud", "hosted", "remote")) { return "2" }
+        Write-Host "  Please answer 1 or 2."
+    }
+}
+
+function Test-EndpointModels {
+    # One GET /models with the bearer key when there is one, metadata only. Returns
+    # @{ Ok; Ids; Status; Error }. A 401/403 is Ok=$false WITH Status set, so the caller
+    # re-asks the KEY rather than the link - the old question never sent a key at all,
+    # so a hosted provider's refusal read as "down" and its model list never arrived.
+    param([string] $Url, [string] $Key = "")
+    $headers = @{ "Accept" = "application/json"; "User-Agent" = "tinycmdr-install" }
+    if ($Key) { $headers["Authorization"] = "Bearer $Key" }
+    try {
+        $resp = Invoke-WebRequest -Uri ($Url.TrimEnd("/") + "/models") -Headers $headers `
+                                  -TimeoutSec 8 -UseBasicParsing
+    } catch {
+        $code = 0
+        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+        $msg = "$($_.Exception.Message)".Replace("`r", " ").Replace("`n", " ")
+        if ($msg.Length -gt 160) { $msg = $msg.Substring(0, 160) }
+        return @{ Ok = $false; Ids = @(); Status = $code; Error = $msg }
+    }
+    $ids = @()
+    try {
+        $data = $resp.Content | ConvertFrom-Json
+        foreach ($m in @($data.data) + @($data.models)) {
+            if ($null -eq $m) { continue }
+            if ($m -is [string]) { $ids += $m }
+            elseif ($m.id) { $ids += "$($m.id)" }
+            elseif ($m.name) { $ids += "$($m.name)" }
+        }
+    } catch { }
+    return @{ Ok = $true; Ids = @($ids); Status = 200; Error = "" }
+}
+
+function Ask-ModelId {
+    # The list the endpoint just advertised, offered as numbers; the plain prompt when
+    # there is nothing to offer.
+    param([string[]] $Ids, [string] $Default = "")
+    if (-not $Ids -or $Ids.Count -eq 0) {
+        $a = (Ask-Text "Model id" $Default -AllowBlank)
+        if ($a) { return $a }
+        return $Default
+    }
+    Write-Host "    models it advertises:"
+    for ($i = 0; $i -lt $Ids.Count; $i++) { Write-Host ("      {0,2}) {1}" -f ($i + 1), $Ids[$i]) }
+    $a = (Ask-Text "Model id (number or name)" $Default -AllowBlank)
+    if (-not $a) { return $Ids[0] }
+    $n = 0
+    if ([int]::TryParse($a, [ref] $n) -and $n -ge 1 -and $n -le $Ids.Count) { return $Ids[$n - 1] }
+    return $a
+}
+
+
+
+# Everything below is transcribed. A Windows install often runs in a window that
+# closes the moment the script ends (or on a host you cannot see), so the reason
+# for a failure has to survive on disk: %TEMP%\tinycmdr-install.log, the same file
+# the .cmd wrapper points at.
+$LogFile = Join-Path $env:TEMP "tinycmdr-install.log"
+try { Start-Transcript -Path $LogFile -Force | Out-Null } catch { }
+# Every Stop-Transcript below routes through here: the transcript sits in %TEMP%
+# (security review residual, 2026-09-23), so scrub whatever secret this run handled
+# before the log goes cold.
+function Stop-TranscriptRedacted {
+    try { Microsoft.PowerShell.Core\Stop-Transcript | Out-Null } catch { }
+    foreach ($s in @($MattermostToken, $TelegramToken, $ModelKey)) {
+        if ($s -and $s.Length -ge 8 -and (Test-Path $LogFile)) {
+            try {
+                $t = Get-Content -Raw -LiteralPath $LogFile
+                if ($t -and $t.Contains($s)) {
+                    [System.IO.File]::WriteAllText($LogFile, $t.Replace($s, "<redacted>"))
+                }
+            } catch { }
+        }
+    }
+}
+trap {
+    Write-Host "`nINSTALL FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Full log: $LogFile"
+    try { Stop-TranscriptRedacted } catch { }
+    if (-not $NoPause) { Read-Host "Press Enter to close" }
+    exit 2
+}
+
+$Unverified = $false    # install ok, but the model endpoint did not answer
+# Which of these the caller actually passed (an update must not push the shipped
+# loopback/`main` defaults over a host that is working).
+$ModelBaseUrlGiven = [bool]$ModelBaseUrl
+$ModelGiven        = $Model -and $Model -ne "main"
+$AppName = $TaskName
+$elevated = ([Security.Principal.WindowsPrincipal] `
+             [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+             [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# Elevation is NOT required for a normal install any more. Everything a reader
+# gets by default lives in their own profile: the folder, the venv, the user
+# PATH entry and the Startup shortcut. Only -AsService (a boot-start scheduled
+# task) needs an elevated shell, and that is checked where it is used.
+if ($AsService -and -not $elevated -and -not $VerifyOnly -and -not $Uninstall) {
+    Write-Host "This needs an elevated PowerShell to register the scheduled task." -ForegroundColor Red
+    Write-Host "Re-run as Administrator, or drop -AsService to install and start at logon"
+    Write-Host "(no administrator rights needed for that)."
+    exit 1
+}
+
+# An elevated window can belong to a DIFFERENT account than the desktop session (UAC asked
+# for another administrator's credentials). An install from there lands entirely in that
+# account's profile - folder, PATH entry, autostart, bot - and the person at the keyboard
+# sees no command and no bot (the shape of a 2026-10-06 report). Nothing about that install
+# can be right, so refuse and name both accounts.
+if ($elevated) {
+    $desktopUser = ""
+    try {
+        $desktopUser = [string](Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    } catch { }
+    if ($desktopUser -and $env:USERNAME -and
+        (($desktopUser -split '\\')[-1] -ne $env:USERNAME)) {
+        Write-Host "This window runs as '$env:USERNAME', but the desktop session belongs to '$desktopUser'." -ForegroundColor Red
+        Write-Host "An install from here would put the folder, the PATH entry, the autostart and the bot" -ForegroundColor Red
+        Write-Host "in '$env:USERNAME''s profile, and this desktop would see none of them." -ForegroundColor Red
+        Write-Host "Re-run WITHOUT elevation - a normal install needs no administrator rights - or log in" -ForegroundColor Yellow
+        Write-Host "as the account that owns this desktop." -ForegroundColor Yellow
+        exit 2
+    }
+}
+
+# ------------------------------------------------------------------ helpers
+
+# PowerShell 5.1 has no BOM-less UTF8 string encoder for Set-Content, and a BOM
+# silently breaks JSON parsing and HTTP headers. Write through this, always.
+function Write-Utf8NoBom {
+    param([string] $Path, [string] $Text)
+    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Invoke-Py {
+    <#
+        Run python and hand back its output (stdout AND stderr) as a string.
+
+        Never let a child's stderr terminate the installer: with
+        ErrorActionPreference = Stop, a native command writing to stderr counts as a
+        TERMINATING error, so a missing dependency or any traceback aborted the whole
+        install and surfaced only the traceback's first line. That is what happened
+        on a host whose Python 3.12 had no `requests` yet.
+    #>
+    param([string] $PythonPath, [Parameter(ValueFromRemainingArguments = $true)] $PyArgs)
+    $EAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $tmp = [IO.Path]::GetTempFileName()
+    try {
+        # Redirect to a FILE rather than 2>&1 | Out-String: PowerShell wraps a native
+        # command's stderr in ErrorRecords, so the captured text arrives decorated with
+        # source lines and CategoryInfo noise. A file gets the raw text.
+        & $PythonPath @PyArgs > $tmp 2>&1
+        return (Get-Content $tmp -Raw)
+    } catch {
+        return "could not run ${PythonPath}: $($_.Exception.Message)"
+    } finally {
+        $ErrorActionPreference = $EAP
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-PyImport {
+    <#
+        Is $Module importable by this interpreter? Uses the EXIT CODE, because
+        matching the child's text is a trap: `$out -match "ok"` is true when the
+        failed command's own text ("print('ok')") is echoed back in the error, so a
+        missing dependency looked present and the install went on to fail later.
+    #>
+    param([string] $PythonPath, [string] $Module)
+    $EAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $PythonPath -c "import $Module" 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $EAP
+    }
+}
+
+function Invoke-Probe {
+    <#
+        One local turn through the agent: no Mattermost token, no port, no admin.
+        Two traps this has already fallen into, both handled here:
+          * a native command writing to stderr counts as a TERMINATING error while
+            ErrorActionPreference is Stop, so a Python traceback aborted the whole
+            installer and reported only the traceback's first line
+          * a console with a legacy code page made Python die printing its own banner
+        Hence: relax the preference for the call only, force UTF-8 for the child, and
+        hand back the real tail of the output.
+    #>
+    param([string] $Dir, [string] $PythonPath)
+    $env:PYTHONIOENCODING = "utf-8"
+    try {
+        return (Invoke-Py $PythonPath (Join-Path $Dir "tinycmdr.py") --once "reply with the single word: READY")
+    } finally {
+        Remove-Item Env:\PYTHONIOENCODING -ErrorAction SilentlyContinue
+    }
+}
+
+function Stop-TinycmdrProcesses {
+    <#
+        Kill the bot AND its supervisor for this install, and wait until they are
+        really gone. Needed before a -Force copy and before an uninstall: the running
+        bot holds tinycmdr.log, its lock and this folder's interpreter image open, so
+        overwriting in place either fails or leaves a stale process alive.
+
+        The bot, its supervisor and the launcher all carry the install dir in their
+        command lines: the vbs launcher passes the full ...\tinycmdr-supervise.py path
+        (measured 2026-10-05 from the vbs template), so one literal match on $Dir covers
+        all three and never reaches a second install. Matching is IndexOf with
+        OrdinalIgnoreCase, never -like: -like reads [ ] * ? in a PATH as wildcards, so a
+        bracketed install dir matched nothing (measured 2026-10-05) and the scoped
+        clause silently let the old bot live. A hand-run bare
+        `python tinycmdr-supervise.py` (no path) is deliberately not killed.
+
+        The matches' CHILDREN die too. The bot runs its tools as child processes, a
+        child can hold the folder as its working directory (Windows refuses to delete
+        a directory that is a live process's current directory) or a file inside it,
+        and the child carries no install dir in its own command line - the name match
+        alone misses it. The shell this runs from, and its ancestors, are spared.
+
+        And it sweeps until nothing matches instead of once: killing the bot makes its
+        supervisor start a fresh one (5 s backoff), and Windows releases a killed
+        process's handles a moment later, so one snapshot leaves a fresh child holding
+        the folder. The loop is bounded (20 s); a stop that finds nothing returns at
+        once.
+    #>
+    param([string] $Dir)
+    $killed = 0
+    $deadline = (Get-Date).AddSeconds(20)
+    # A CIM hiccup must not abort a removal: it ends the sweep with whatever is
+    # already killed, the way the one-shot sweep used to swallow its errors.
+    try {
+        while ($true) {
+            $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+            $roots = @($procs | Where-Object {
+                if (-not $_.CommandLine) { return $false }
+                if ($_.Name -like 'python*' -or $_.Name -eq 'wscript.exe') {
+                    return $_.CommandLine.IndexOf($Dir,
+                        [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                }
+                return $false
+            })
+            if (-not $roots.Count) { return $killed }
+            # Our own ancestor chain (this shell, the wrapper, the terminal) is off
+            # limits: a removal run from a shell the bot itself launched must not
+            # kill that shell.
+            $byId = @{}
+            foreach ($p in $procs) { $byId[[int]$p.ProcessId] = $p }
+            $self = @()
+            $walk = [int]$PID
+            while ($byId.ContainsKey($walk)) {
+                $self += $walk
+                $walk = [int]$byId[$walk].ParentProcessId
+            }
+            $ids = @{}
+            foreach ($r in $roots) { $ids[[int]$r.ProcessId] = $true }
+            $added = $true
+            while ($added) {
+                $added = $false
+                foreach ($p in $procs) {
+                    if ($ids.ContainsKey([int]$p.ParentProcessId) -and
+                        -not $ids.ContainsKey([int]$p.ProcessId)) {
+                        $ids[[int]$p.ProcessId] = $true
+                        $added = $true
+                    }
+                }
+            }
+            foreach ($id in @($ids.Keys)) {
+                if ($self -contains $id) { continue }
+                try { Stop-Process -Id $id -Force -ErrorAction Stop; $killed++ } catch { }
+            }
+            if ((Get-Date) -ge $deadline) { return $killed }
+            Start-Sleep -Milliseconds 500
+        }
+    } catch {
+        return $killed
+    }
+}
+
+function Remove-TinycmdrFolder {
+    <#
+        Remove $Dir, retrying instead of giving up on the first "being used by another
+        process". Windows releases a killed process's file handles asynchronously, and
+        the supervisor may not have been visible to the first sweep, so a one-shot
+        Remove-Item leaves the folder - and a half-removed install - behind.
+    #>
+    param([string] $Dir)
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            Remove-Item $Dir -Recurse -Force -ErrorAction Stop
+            return $true
+        } catch {
+            if ($i -eq 5) {
+                Say "NOTE    : could not remove ${Dir}: $($_.Exception.Message)"
+                Say "          close anything using it, then remove the folder by hand"
+                return $false
+            }
+            $null = Stop-TinycmdrProcesses -Dir $Dir
+            Start-Sleep -Seconds 2
+        }
+    }
+    return $false
+}
+
+function Say  ($m) { Write-Host "  $m" }
+function Head ($m) { Write-Host "`n== $m" -ForegroundColor Cyan }
+function Fail ($m) {
+    Write-Host "`nFAILED: $m" -ForegroundColor Red
+    Write-Host "Full log: $LogFile"
+    try { Stop-TranscriptRedacted } catch { }
+    if (-not $NoPause) { Read-Host "Press Enter to close" }
+    exit 1
+}
+
+# --------------------------------------------------------------- user PATH
+# The user PATH is a REG_EXPAND_SZ value under HKCU\Environment, and it is FULL of
+# other installers' entries - many written as "%JAVA_HOME%\bin". Reading it with
+# [Environment]::GetEnvironmentVariable expands those; SetEnvironmentVariable then
+# writes the EXPANDED text back as a plain REG_SZ, so every unrelated %VAR% entry on
+# the machine is frozen at whatever it resolved to that day (and the
+# uninstaller repeated it). Edit the registry value itself instead: read with
+# DoNotExpandEnvironmentNames so the "%VAR%" text survives, write ExpandString, and
+# only ever append or remove OUR one entry.
+function Get-UserPathRaw {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment")
+    if (-not $key) { return "" }
+    try {
+        return [string]$key.GetValue("Path", "",
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } finally { $key.Close() }
+}
+
+function Set-UserPathRaw {
+    param([string] $Value)
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+    try { $key.SetValue("Path", $Value, [Microsoft.Win32.RegistryValueKind]::ExpandString) }
+    finally { $key.Close() }
+}
+
+function Send-EnvBroadcast {
+    # Windows only re-reads HKCU\Environment when someone broadcasts WM_SETTINGCHANGE.
+    # Without it, Explorer keeps the OLD PATH and a window opened right after the
+    # install answers "The term 'tinycmdr' is not recognized" until logoff (measured
+    # 2026-10-06 on a brand-new install). Best-effort: this must never fail the install.
+    try {
+        if (-not ("Tinycmdr.EnvBroadcast" -as [type])) {
+            Add-Type -Namespace Tinycmdr -Name EnvBroadcast -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg,
+    System.UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout,
+    out System.UIntPtr lpdwResult);
+'@
+        }
+        $out = [System.UIntPtr]::Zero
+        [void][Tinycmdr.EnvBroadcast]::SendMessageTimeout([System.IntPtr]0xffff, 0x001A,
+            [System.UIntPtr]::Zero, "Environment", 2, 2000, [ref]$out)
+    } catch { }
+}
+
+function Get-UserPathParts {
+    # Non-empty entries only, in order, with any %VAR% text kept verbatim.
+    return @((Get-UserPathRaw) -split ';' | Where-Object { $_ -and $_.Trim() })
+}
+
+function Test-UserPathHas {
+    param([string] $Entry)
+    $want = $Entry.TrimEnd('\')
+    foreach ($p in (Get-UserPathParts)) { if ($p.TrimEnd('\') -eq $want) { return $true } }
+    return $false
+}
+
+function Resolve-Python {
+    param([string] $Explicit, [switch] $Force)
+    $cands = @()
+    if ($Explicit) { $cands += $Explicit }
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        $cmdPath = (Get-Command python).Source
+        if ($cmdPath -notmatch 'WindowsApps\\python\.exe$') { $cands += $cmdPath }
+    }
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        try {
+            $p = (& py -3.12 -c "import sys; print(sys.executable)" 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $p) { $cands += $p.Trim() }
+        } catch { }
+        try {
+            $p = (& py -3.11 -c "import sys; print(sys.executable)" 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $p) { $cands += $p.Trim() }
+        } catch { }
+        try {
+            $p = (& py -3.10 -c "import sys; print(sys.executable)" 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $p) { $cands += $p.Trim() }
+        } catch { }
+    }
+    $cands += @(Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python31*\python.exe" -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending | Select-Object -ExpandProperty FullName)
+    $cands += @(Get-ChildItem "C:\Users\*\AppData\Local\Programs\Python\Python31*\python.exe" -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending | Select-Object -ExpandProperty FullName)
+    $cands += @(Get-ChildItem "C:\Program Files\Python31*\python.exe" -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending | Select-Object -ExpandProperty FullName)
+    $cands += @(Get-ChildItem "C:\Python31*\python.exe" -ErrorAction SilentlyContinue |
+                Select-Object -ExpandProperty FullName)
+    foreach ($c in ($cands | Select-Object -Unique)) {
+        if (-not (Test-Path $c)) { continue }
+        try {
+            $v = (Invoke-Py $c -c "import sys; print('%d.%d' % sys.version_info[:2])")
+            $v = ($v -split "`n" | Where-Object { $_.Trim() -match '^\d+\.\d+$' } | Select-Object -First 1)
+            if (-not $v) { continue }
+            $ver = [version]$v.Trim()
+            if ($ver -ge [version]"3.10" -and $ver -le [version]"3.12") {
+                return @{ Path = $c; Version = $v.Trim() }
+            }
+            if ($ver -gt [version]"3.12") {
+                if ($Force) { return @{ Path = $c; Version = $v.Trim() } }
+                Write-Host ("    python {0} at {1} is newer than anything this was tested on: the pinned mmpy_bot is the last release that connects on 3.13+; the supported band is 3.10-3.12 (pass -ForcePython to try anyway)" -f $v.Trim(), $c) -ForegroundColor Yellow
+            }
+        } catch { }
+    }
+    return $null
+}
+
+# ------------------------------------------------------------- fleet defaults
+
+# install\fleet-defaults.json (shipped in the package) supplies this fleet's
+# values so a host needs no arguments: Mattermost host, model endpoint, allowed
+# user. Anything passed on the command line wins.
+$fleet = $null
+$fleetFile = Join-Path $PSScriptRoot "fleet-defaults.json"
+if (Test-Path $fleetFile) {
+    try { $fleet = Get-Content $fleetFile -Raw | ConvertFrom-Json } catch { $fleet = $null }
+}
+$fromFleet = @()
+if ($fleet) {
+    if (-not $MattermostUrl -and $fleet.mattermost_url) {
+        $MattermostUrl = [string]$fleet.mattermost_url; $fromFleet += "mattermost url" }
+    if (-not $AllowedUser -and $fleet.allowed_user) {
+        $AllowedUser = [string]$fleet.allowed_user; $fromFleet += "allowed user" }
+    if (-not $ModelBaseUrl -and $fleet.model_base_url) {
+        $ModelBaseUrl = [string]$fleet.model_base_url; $fromFleet += "model endpoint" }
+    if ($fleet.model -and ($Model -eq "main")) { $Model = [string]$fleet.model }
+    # A fleet kit names the fleet's own install folder and keeps the boot-start
+    # task the fleet's hosts run. The public package ships no fleet-defaults.json,
+    # so a reader gets the profile default and the no-admin autostart.
+    if (-not $InstallDir -and $fleet.install_dir) {
+        $InstallDir = [string]$fleet.install_dir; $fromFleet += "install dir" }
+    if ($fleet.as_service -eq $true) { $AsService = $true }
+}
+
+# The guard at the top of this file ran before the defaults above could set
+# $AsService, and the fleet kit exists precisely to ship as_service: true - so an
+# unelevated fleet push sailed past the guard and died inside Register-ScheduledTask,
+# after the files, the venv, config.json and .env had already been written.
+# Re-check now that fleet-defaults.json has had its say.
+if ($AsService -and -not $elevated -and -not $VerifyOnly -and -not $Uninstall) {
+    Write-Host "This needs an elevated PowerShell to register the scheduled task." -ForegroundColor Red
+    Write-Host "Re-run as Administrator, or drop -AsService to install and start at logon"
+    Write-Host "(no administrator rights needed for that)."
+    exit 1
+}
+
+# ------------------------------------------------- where this install goes
+# Your own profile. Nothing outside it is written by a default install - no
+# C:\ root folder, no machine-wide PATH entry, no service registration - so no
+# elevated shell is involved and nothing has to be granted.
+if (-not $InstallDir) { $InstallDir = Join-Path $env:USERPROFILE "tinycmdr" }
+$InstallDir = $InstallDir.TrimEnd('\')
+# The autostart entry a default install owns (removed by -Uninstall). A -AsService
+# install does not use this file.
+$StartupLink = Join-Path $env:APPDATA ("Microsoft\Windows\Start Menu\Programs\Startup\" +
+                                       "$AppName.lnk")
+
+# ------------------------------------------------------------------ uninstall
+
+if ($Uninstall) {
+    Head "uninstalling $AppName"
+    $taskExists = $null -ne (Get-ScheduledTask -TaskName $AppName -ErrorAction SilentlyContinue)
+    # The user PATH counts too: a folder someone deleted by hand still has a
+    # dead PATH entry pointing at it, and the old early-exit walked away without saying so.
+    $pathHasEntry = Test-UserPathHas $InstallDir
+    if (-not $taskExists -and -not (Test-Path $InstallDir) -and -not (Test-Path $StartupLink) -and
+        -not $pathHasEntry) {
+        Say "nothing to remove (no task '$AppName', no $InstallDir)"
+        try { Stop-TranscriptRedacted } catch { }
+        exit 0
+    }
+    if ($taskExists -and -not $SkipTask) {
+        # Only OUR task goes. The task name is one per user, not per folder - a second
+        # install (or a probe) registers under the same name - so the action is read
+        # first: only a task whose launcher sits under $InstallDir is this install's.
+        # Taking the other one away would stop a live install's autostart while it
+        # keeps running (the plist side paid for exactly this on 2026-09-24).
+        $taskMine = $true
+        try {
+            $acts = @((Get-ScheduledTask -TaskName $AppName).Actions)
+            $taskMine = @($acts | Where-Object {
+                "$($_.Execute) $($_.Arguments)".IndexOf(
+                    $InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            }).Count -gt 0
+        } catch { $taskMine = $true }   # unreadable: keep the old behaviour
+        if (-not $taskMine) {
+            Say "task    : $AppName belongs to another install - left alone"
+        } else {
+            try { Stop-ScheduledTask -TaskName $AppName -ErrorAction SilentlyContinue } catch { }
+            try {
+                Unregister-ScheduledTask -TaskName $AppName -Confirm:$false -ErrorAction Stop
+                Say "task    : $AppName removed"
+            } catch { Say "task    : could not remove $AppName ($($_.Exception.Message))" }
+        }
+    }
+    if (Test-Path $StartupLink) {
+        # The same rule for the logon shortcut, and the same reason: one file per
+        # $AppName, and only the one whose target is THIS folder goes.
+        $lnkMine = $true
+        try {
+            $sh = New-Object -ComObject WScript.Shell
+            $lnk = $sh.CreateShortcut($StartupLink)
+            $lnkText = ("$($lnk.TargetPath) $($lnk.Arguments)").Trim()
+            if ($lnkText) {
+                $lnkMine = $lnkText.IndexOf(
+                    $InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            }
+        } catch { $lnkMine = $true }    # unreadable: keep the old behaviour
+        if (-not $lnkMine) {
+            Say "startup : $AppName.lnk points at another install - left alone"
+        } else {
+            Remove-Item $StartupLink -Force -ErrorAction SilentlyContinue
+            Say "startup : $AppName.lnk removed"
+        }
+    }
+    $n = Stop-TinycmdrProcesses -Dir $InstallDir
+    if ($n) { Say "stopped : $n process(es)" }
+    # The PATH entry is removed AFTER the folder question, deliberately: it
+    # used to go first, so answering "n" to "Delete ...?" left a working install whose
+    # `tinycmdr` verb had been silently cut off its PATH. Keeping the folder keeps the
+    # verb. And an entry only goes once its folder is really gone, so a removal that
+    # failed (still held by a process) does not orphan the verb either.
+    if (Test-Path $InstallDir) {
+        # Windows refuses to delete a directory that any live process has as its
+        # current directory - this shell included, and `cd %USERPROFILE%\tinycmdr`
+        # before running the removal is a natural thing to do. Step out first;
+        # install-tinycmdr.cmd does the same for its own shell on an uninstall.
+        try {
+            $here = (Get-Location).Path
+            if ($here -and ($here.TrimEnd('\') -eq $InstallDir -or
+                    $here.StartsWith($InstallDir + '\',
+                        [System.StringComparison]::OrdinalIgnoreCase))) {
+                Set-Location $env:TEMP
+            }
+        } catch { }
+        if (-not $Force) {
+            if ($NoPause) { Fail "refusing to delete $InstallDir without -Force (or run interactively to confirm)" }
+            $ans = Read-Host "Delete $InstallDir and everything in it? (y/N)"
+            if ($ans -notmatch '^(y|yes)$') {
+                Say "kept $InstallDir"
+                Say "path    : $InstallDir stays on your user PATH (its folder is still there)"
+                try { Stop-TranscriptRedacted } catch { }
+                exit 0
+            }
+        }
+        if (Remove-TinycmdrFolder -Dir $InstallDir) {
+            Say "removed : $InstallDir"
+        } else {
+            # This used to fall through to "done" and exit 0 with the folder still
+            # there, so a half-removal read exactly like a clean one. Name what is
+            # left and fail; the PATH entry above stays for the same reason.
+            Say "left    : $InstallDir - something still holds it"
+            Say "          a shell or editor sitting in that folder blocks the delete on"
+            Say "          Windows; close it, then run the removal again"
+            try { Stop-TranscriptRedacted } catch { }
+            exit 2
+        }
+    }
+    # undo the user-Path entry the install added (the verb surface)
+    if ((-not (Test-Path $InstallDir)) -and (Test-UserPathHas $InstallDir)) {
+        $keep = @(Get-UserPathParts | Where-Object { $_.TrimEnd('\') -ne $InstallDir.TrimEnd('\') })
+        Set-UserPathRaw ($keep -join ';')
+        Send-EnvBroadcast
+        Say "path    : $InstallDir removed from the user Path"
+    }
+    Say "done"
+    try { Stop-TranscriptRedacted } catch { }
+    if (-not $NoPause) { Read-Host "`nPress Enter to close" }
+    exit 0
+}
+
+# ------------------------------------------------------------------- preamble
+
+Head "tinycmdr installer"
+Say "package : $Source"
+Say "target  : $InstallDir"
+if ($fromFleet.Count) { Say "fleet   : $($fromFleet -join ', ') (from fleet-defaults.json)" }
+
+# ---------------------------------------------------------------- verify only
+# BEFORE the interpreter step, deliberately: -VerifyOnly is documented as "report on an
+# existing install, change nothing", yet it used to fall into the Python
+# discovery/auto-install block below - a winget install, then a python.org download -
+# before it verified a single thing. A verify run must not fetch a runtime.
+if ($VerifyOnly) {
+    if (-not (Test-Path (Join-Path $InstallDir "tinycmdr.py"))) {
+        Write-Host "no tinycmdr.py in $InstallDir" -ForegroundColor Red
+        try { Stop-TranscriptRedacted } catch { }
+        exit 1
+    }
+    Head "verifying $InstallDir"
+    # An install carries its own interpreter; probe that one, or the check grades a
+    # different python than the bot actually runs under. Only when the venv is missing do
+    # we look for a machine python - and never install one from here.
+    $venvProbe = Join-Path $InstallDir "venv\Scripts\python.exe"
+    $probePy = $null
+    if (Test-Path $venvProbe) {
+        $probePy = $venvProbe
+    } else {
+        $found = Resolve-Python -Explicit $Python -Force:$ForcePython
+        if ($found) { $probePy = $found.Path }
+    }
+    if (-not $probePy) {
+        Write-Host "no python to probe with - is $InstallDir complete?" -ForegroundColor Red
+        try { Stop-TranscriptRedacted } catch { }
+        exit 1
+    }
+    $p = Invoke-Probe -Dir $InstallDir -Python $probePy
+    Write-Host (($p.Trim() -split "`n" | Select-Object -Last 6) -join "`n")
+    try { Stop-TranscriptRedacted } catch { }
+    if ($p -match "READY") {
+        Write-Host "OK: the agent answered" -ForegroundColor Green
+        if (-not $NoPause) { Read-Host "Press Enter to close" }
+        exit 0
+    }
+    Write-Host "NOT VERIFIED: no answer from the model endpoint - check llm.base_url / llm.model" -ForegroundColor Yellow
+    if (-not $NoPause) { Read-Host "Press Enter to close" }
+    exit 3
+}
+
+# ------------------------------------------------------------- 1. python 3.12
+Head "finding Python"
+$py = Resolve-Python -Explicit $Python -Force:$ForcePython
+if (-not $py) {
+    Say "Python 3.10-3.12 was not found on this machine - installing Python 3.12 automatically..."
+    $installed = $false
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Say "installing Python 3.12 via winget..."
+        try {
+            & winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
+            if ($LASTEXITCODE -eq 0) { $installed = $true }
+        } catch { }
+        # winget writes the new PATH into the registry; THIS process still holds the
+        # old one, so refresh it before looking again or the install just made is
+        # invisible to the search below.
+        $env:Path = ([Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                     [Environment]::GetEnvironmentVariable("Path", "User"))
+        Start-Sleep -Seconds 2
+    }
+    if (-not $installed) {
+        Say "downloading official installer from python.org..."
+        # python.org publishes one installer per architecture, and the URL used to be
+        # amd64 on every host - an ARM64 box downloaded something it could not run while
+        # the winget path right above picked the right one.
+        $pyArch = switch ($env:PROCESSOR_ARCHITECTURE) {
+            "AMD64" { "amd64" }
+            "ARM64" { "arm64" }
+            "x86"   { "win32" }
+            default { "amd64" }
+        }
+        $installerName = "python-3.12.8-$pyArch.exe"
+        $installerUrl = "https://www.python.org/ftp/python/3.12.8/$installerName"
+        $installerPath = Join-Path $env:TEMP $installerName
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
+            Say "running Python installer silently..."
+            $proc = Start-Process -FilePath $installerPath -ArgumentList "/quiet","InstallAllUsers=0","PrependPath=1","Include_pip=1" -Wait -PassThru
+            if ($proc.ExitCode -eq 0) { $installed = $true }
+        } catch {
+            Write-Host "download failed: $_" -ForegroundColor Red
+        }
+    }
+    $py = Resolve-Python -Explicit $Python -Force:$ForcePython
+}
+if (-not $py) { Fail "could not automatically install Python 3.12. Please install from https://python.org and re-run." }
+Say "python  : $($py.Path)  (v$($py.Version))"
+# Prove the interpreter's word size matches the host: the fallback download
+# used to be amd64 on every machine, and a 32-bit python on a 64-bit host starts fine,
+# then dies during the dependency install with a DLL error that names nothing useful.
+if ([Environment]::Is64BitOperatingSystem -and
+    (Invoke-Py $py.Path -c "import struct; print(struct.calcsize('P') * 8)").Trim() -eq "32") {
+    Say "WARNING : python at $($py.Path) is 32-BIT on a 64-bit host"
+    Say "          install the 64-bit Python from python.org, then re-run this installer"
+}
+
+# The dependency set is the one the code declares in its own header:
+#   pip install requests mmpy_bot croniter
+# Installing only `requests` produced a bot that started, logged two warnings and
+# never connected -- mmpy_bot IS the Mattermost client (live 2026-09-10).
+# They are installed further down, into this install's OWN virtual environment:
+# that folder does not exist yet here, and the reader has not agreed to the
+# install. What matters now is only that an interpreter exists at all.
+
+# ------------------------------------------------------ identity of this install
+# $AppName is ONE name per user, not per folder: -Uninstall removes $AppName.lnk and that
+# task by name, and a run that keeps the default name writes over whatever is already
+# registered under it - so a probe or a second install silently takes the first one's
+# autostart away. Measured on the macOS side (2026-09-26), where test installs sharing the
+# default label left the real agent unregistered and silent.
+$foreign = ""
+if (Test-Path $StartupLink) {
+    $lnkText = ""
+    try {
+        $sh = New-Object -ComObject WScript.Shell
+        $lnk = $sh.CreateShortcut($StartupLink)
+        $lnkText = ("$($lnk.TargetPath) $($lnk.Arguments) $($lnk.WorkingDirectory)").Trim()
+    } catch { }
+    if ($lnkText -and ($lnkText -notlike "*$InstallDir*")) {
+        $foreign = "$StartupLink -> $lnkText"
+    }
+}
+if (-not $foreign -and -not $SkipTask) {
+    $t = Get-ScheduledTask -TaskName $AppName -ErrorAction SilentlyContinue
+    if ($t) {
+        $act = @($t.Actions)[0]
+        $actText = ("$($act.Execute) $($act.Arguments)").Trim()
+        if ($actText -and ($actText -notlike "*$InstallDir*")) {
+            $foreign = "scheduled task $AppName -> $actText"
+        }
+    }
+}
+if ($foreign) {
+    Fail "the name $AppName already belongs to another install:
+    $foreign
+This run would take that autostart entry away. Give this install its own name:
+    INSTALL-WINDOWS.cmd -TaskName Tinycmdr-$(hostname) <your switches>
+(a probe or a second install always should), or remove the other install first:
+    INSTALL-WINDOWS.cmd -Uninstall"
+}
+
+# ----------------------------------------------------------------- 2. the app
+# What the install cannot work without. Every name here must also be in the package: this
+# check is the one place where a file that stopped shipping is fatal instead of silent, and
+# the reader is the one who finds out. build-package.py verifies this list against the
+# staged package, so the two cannot drift apart again.
+$required = @("tinycmdr.py", "tinycmdr-supervise.py",
+              "config.example.json", ".env.example", "skills")
+foreach ($f in $required) {
+    if (-not (Test-Path (Join-Path $Source $f))) { Fail "package is missing $f (run the installer from the extracted zip)" }
+}
+if ((Test-Path $InstallDir) -and -not $Force) {
+    $existing = (Get-ChildItem $InstallDir -ErrorAction SilentlyContinue | Measure-Object).Count
+    if ($existing -gt 0) {
+        if ($Ask) {
+            # "use -Force" is not something a person double-clicking this can act on. Ask, and
+            # mean the same thing -Force means: the app files are replaced, the state stays.
+            Write-Host ""
+            Write-Host "  There is already an install in $InstallDir"
+            Write-Host "  ($existing item(s) - your notes, ledger, sessions and secrets are kept)"
+            if (Ask-Yes "  Replace its app files with this package?" $true) {
+                $Force = $true
+            } else {
+                Say "nothing was changed"
+                try { Stop-TranscriptRedacted } catch { }
+                if (-not $NoPause) { Read-Host "`nPress Enter to close" }
+                exit 0
+            }
+        } else {
+            Fail "$InstallDir already exists and is not empty - use -Force to redo it in place, or -Uninstall to remove it, or -InstallDir <other>"
+        }
+    }
+}
+# Secrets, from one .env-style file. The search keys are the same on every host,
+# so they live in exactly one place you keep (a share is fine); the Mattermost
+# token is per host. Any of these four keys found in the file gets written into
+# the install's .env - nothing has to be typed or hand-edited.
+$secrets = @{}
+$secretsFrom = ""
+if (-not $SecretsFile) {
+    $cand = Join-Path $PSScriptRoot "fleet-secrets.env"
+    if (Test-Path $cand) { $SecretsFile = $cand }
+}
+if ($SecretsFile) {
+    if (-not (Test-Path $SecretsFile)) { Fail "no such secrets file: $SecretsFile" }
+    foreach ($line in Get-Content $SecretsFile) {
+        $s = $line.Trim()
+        if (-not $s -or $s.StartsWith("#") -or $s -notmatch "=") { continue }
+        $k, $v = $s.Split("=", 2)
+        if ($v.Trim()) { $secrets[$k.Trim()] = $v.Trim() }
+    }
+    $secretsFrom = $SecretsFile
+    Say "secrets : $($secrets.Count) key(s) from $SecretsFile"
+}
+
+# Extra endpoints, either as switches (repeatable - this is also how a script adds one)
+# or answered at the prompt below. "<base_url>;<model>;<alias>;<key>", the last two
+# optional; the key goes to .env under a generated name, never into config.json.
+# A '|' is accepted too, but it CANNOT be used through INSTALL-WINDOWS.cmd: cmd.exe
+# reads it as a pipe and hands the pieces to different processes.
+$script:Fallbacks = @()
+$fbGiven = 0
+foreach ($spec in $AddEndpoint) {
+    if (-not $spec -or -not $spec.Trim()) { continue }
+    $parts = @(($spec -split '[;|]') + @("", "", "", ""))
+    $u = "$($parts[0])".Trim(); $m = "$($parts[1])".Trim()
+    $a = "$($parts[2])".Trim(); $k = "$($parts[3])".Trim()
+    if (-not $u) { continue }
+    $fbGiven++
+    $script:Fallbacks += [pscustomobject]@{ Url = $u; Model = $m; Alias = $a; Key = $k
+                                            Env = "TINYCMDR_ENDPOINT${fbGiven}_API_KEY" }
+    Say "endpoint added: $m at $u"
+}
+
+# -SearchEgress takes true or false; "" is "leave this host's own". Anything else
+# would be read as false, so an off-LAN search stayed refused with nothing on screen
+# saying why. Lowercased here so the switch and the question agree on one spelling.
+if ($SearchEgress -and $SearchEgress.ToLower() -notin @("true", "false")) {
+    Fail "-SearchEgress takes true or false (got '$SearchEgress')"
+}
+if ($SearchEgress) { $SearchEgress = $SearchEgress.ToLower() }
+
+# A re-run over an install that is already configured walked the whole wizard again -
+# server, token, endpoint, key - which reads as "it is resetting me" when it is only
+# re-asking. Ask ONCE, with keeping as the default; "No" still reaches the full wizard, so
+# a reinstall can still change or add a lane.
+$KeepConn = $false
+if ($Ask -and (Test-Path (Join-Path $InstallDir "config.json")) -and
+        (Test-Path (Join-Path $InstallDir ".env")) -and
+        [bool](Select-String -Path (Join-Path $InstallDir ".env") `
+                             -Pattern '^TINYCMDR_(MM|TG)_TOKEN=.+' -Quiet)) {
+    Write-Host ""
+    Write-Host "  There is already a configured install in $InstallDir"
+    Write-Host "  (config.json and .env are used as they are - nothing to re-enter)"
+    $KeepConn = Ask-Yes "  Keep the existing configuration?" $true
+}
+
+if ($Ask -and -not $KeepConn) {
+    Head "how you talk to it"
+    Write-Host ""
+    Write-Host "tinycmdr answers in one or more of these. The page is the DEFAULT door; a chat"
+    Write-Host "account is what answers messages in the background."
+    $picked = Ask-Many "How should you talk to it? Pick any that apply - they work together." @(
+        "The web page (the default door: token-gated, opens on this machine or your network)",
+        "A Mattermost bot account (paste a bot token from your server)",
+        "A Telegram bot account (a token from @BotFather; DMs only, nothing to host)")
+    $WantWeb = $picked -contains 1
+    $WantChat = $picked -contains 2
+    $WantTg = $picked -contains 3
+    Write-Host ""
+    Write-Host "  Sessions by hand are always available, no install needed: run tinycmdr --cli for a"
+    Write-Host "  console, or tinycmdr --once ""<task>"" for one shot."
+
+    if ($WantChat) {
+        Write-Host ""
+        $known = if ($MattermostUrl -and $MattermostUrl -ne "CHANGE-ME.example.com") { $MattermostUrl } else { "" }
+        if ($known) { Write-Host "  (leave blank to keep ${known})" }
+        $MattermostUrl = Ask-Text "Mattermost server, no https:// (e.g. chat.example.com)" $known
+        # The secrets file is read before this, so a token handed over with -SecretsFile or a
+        # package default is never asked for twice.
+        if (-not $MattermostToken -and $secrets["TINYCMDR_MM_TOKEN"]) {
+            $MattermostToken = $secrets["TINYCMDR_MM_TOKEN"]
+            $tokenSource = "the secrets file"
+        }
+        # ASK even when a token is already known: Enter keeps it, and a reinstall can
+        # now change or add one (the question used to be skipped outright).
+        if ($MattermostToken) {
+            Write-Host "  (a token is already known from the package, the secrets file or .env)"
+        }
+        $in = Ask-Text "Bot token (input hidden; paste, or Enter to keep what is known)" -Secret -AllowBlank
+        if ($in) { $MattermostToken = $in; $tokenSource = "prompt" }
+        $u = Ask-Text "Your Mattermost user id (optional, but without it the bot ignores your DMs)"
+        if ($u) { $AllowedUser = $u }
+    }
+
+    if ($WantTg) {
+        Write-Host ""
+        if ($TelegramToken) {
+            Write-Host "  (a Telegram token is already known from a switch or .env - kept)"
+        } else {
+            $in = Ask-Text "Telegram bot token from @BotFather (input hidden; paste and press Enter)" -Secret
+            if ($in) { $TelegramToken = $in }
+        }
+        $tg = Ask-Text "Your numeric Telegram id (message @userinfobot for it; without it the bot ignores every DM)"
+        if ($tg) { $TelegramIds = $tg }
+        if ($WantChat) {
+            Write-Host ""
+            Write-Host "  NOTE: with BOTH tokens set, this one agent serves BOTH lanes -"
+            Write-Host "        Mattermost and Telegram - in the same process."
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Where does the model live? Any OpenAI-compatible endpoint: llama.cpp, Ollama,"
+    Write-Host "vLLM (local, no key) or a hosted provider (cloud, needs an API key)."
+    $mb = if ($ModelBaseUrl) { $ModelBaseUrl } else { "http://127.0.0.1:8081/v1" }
+    $kindDefault = if ($mb -match "127\.0\.0\.1|localhost|10\.|192\.168\.|::1") { "1" } else { "2" }
+    $kind = Ask-Choose "Which kind of endpoint is it?" $kindDefault `
+        "local / my LAN (no key)" "cloud / hosted (needs an API key)"
+    $ModelKey = ""
+    if ($kind -eq "2") {
+        $ModelKey = Ask-Text "API key for the provider (input hidden)" -Secret
+    }
+    # Ask, PROBE with the key in hand, and offer what it advertises. A typo here writes no
+    # error until the first request, so it is checked with the operator watching. Three
+    # tries, then it keeps the URL and names the command that fixes it later.
+    $ids = @()
+    $urlTries = 0
+    while ($true) {
+        $lbl = if ($kind -eq "2") { "Endpoint (e.g. https://api.provider.com/v1)" } else { "Model endpoint" }
+        $ModelBaseUrl = Ask-Text $lbl $mb
+        $keyTries = 0
+        while ($true) {
+            $probe = Test-EndpointModels $ModelBaseUrl $ModelKey
+            if (-not $probe.Ok -and ($probe.Status -in @(401, 403)) -and $kind -eq "2") {
+                $keyTries++
+                if ($keyTries -ge 3) {
+                    Write-Host "  the provider still refuses the key - keeping $ModelBaseUrl unverified"
+                    break
+                }
+                Write-Host "  the provider refused that key (HTTP $($probe.Status))"
+                $ModelKey = Ask-Text "API key (input hidden, try again)" -Secret
+                continue
+            }
+            break
+        }
+        if ($probe.Ok) {
+            $ids = @($probe.Ids)
+            if ($ids.Count) {
+                Write-Host ("  OK reachable - it advertises: " + ($ids -join ", "))
+            } else {
+                Write-Host "  OK reachable (no model list advertised)"
+            }
+            break
+        }
+        Write-Host "  no answer from $ModelBaseUrl`: $($probe.Error)"
+        $urlTries++
+        if ($urlTries -ge 3) {
+            Write-Host "  keeping it anyway - fix it later with: tinycmdr model endpoint <url>"
+            $ids = @()
+            break
+        }
+        Write-Host "  check the host and port (the server may not be running yet)."
+    }
+    $modelDefault = if ($Model -and $Model -ne "main") { $Model } elseif ($ids.Count) { $ids[0] } else { "main" }
+    $Model = Ask-ModelId $ids $modelDefault
+    # The answer is THIS run's choice, so it must be written even over an existing
+    # config.json (an empty "was it given" marker means "keep what the host has").
+    $ModelBaseUrlGiven = $true
+    $ModelGiven = $true
+
+    $CloudFallback = $false          # may automatic failover use an off-LAN endpoint?
+    # Extra endpoints: llm.fallbacks, tried in order when the primary fails. Each one gets
+    # the same conversation as the primary: local or cloud, the key (cloud), then the link
+    # - probed WITH the key - then the model from what it advertises. Its key goes to .env
+    # under a generated name the entry's api_key_env points at, never into config.json.
+    while ($true) {
+        if (-not (Ask-Yes "Add another endpoint?" $false)) { break }
+        $n = $script:Fallbacks.Count + 1
+        $fbKind = Ask-Choose "Endpoint #${n}: local or cloud?" "1" `
+            "local / my LAN (no key)" "cloud / hosted (needs an API key)"
+        $fbKey = ""
+        if ($fbKind -eq "2") { $fbKey = Ask-Text "API key for it (input hidden)" -Secret }
+        $fbLbl = if ($fbKind -eq "2") { "Endpoint #$n (e.g. https://api.provider.com/v1)" } `
+                 else { "Endpoint #$n (OpenAI-compatible /v1 root)" }
+        $fbUrl = Ask-Text $fbLbl
+        if (-not $fbUrl) { Write-Host "  (no address given - nothing added)"; continue }
+        if ($fbUrl -notmatch "127\.0\.0\.1|localhost|::1|10\.|192\.168\.") {
+            if (-not $CloudFallback) {
+                if (Ask-Yes "Allow automatic failover to off-LAN endpoints when the local one fails?" $false) {
+                    $CloudFallback = $true
+                }
+            }
+        }
+        $fbKeyTries = 0
+        while ($true) {
+            $fbProbe = Test-EndpointModels $fbUrl $fbKey
+            if (-not $fbProbe.Ok -and ($fbProbe.Status -in @(401, 403)) -and $fbKind -eq "2") {
+                $fbKeyTries++
+                if ($fbKeyTries -ge 3) {
+                    Write-Host "  the provider still refuses the key - adding it with an unchecked model"
+                    break
+                }
+                Write-Host "  the provider refused that key (HTTP $($fbProbe.Status))"
+                $fbKey = Ask-Text "API key (input hidden, try again)" -Secret
+                continue
+            }
+            break
+        }
+        $fbIds = @()
+        if ($fbProbe.Ok) {
+            $fbIds = @($fbProbe.Ids)
+            if ($fbIds.Count) { Write-Host ("  OK reachable - it advertises: " + ($fbIds -join ", ")) }
+        } else {
+            Write-Host "  no answer from $fbUrl`: $($fbProbe.Error) - the model id is unchecked"
+        }
+        $fbModel = Ask-ModelId $fbIds ""
+        $fbAlias = Ask-Text "Alias, so /model <alias> switches to it (blank = none)" -AllowBlank
+        $script:Fallbacks += [pscustomobject]@{ Url = $fbUrl; Model = $fbModel
+                                                Alias = $fbAlias; Key = $fbKey
+                                                Env = "TINYCMDR_ENDPOINT${n}_API_KEY" }
+        Write-Host "  endpoint #$n added: $fbModel at $fbUrl"
+    }
+
+    # ---- web search: may it leave this machine? ----
+    # Off unless asked. Both built-in providers are third parties, and the keyless anonymous
+    # tier used to send the model's query with nobody asked and nothing on screen saying so
+    # (2026-09-27). A provider ON this LAN - a searxng entry - never needs this, so
+    # "no" here still leaves a working search if one is configured. The switch wins: it skips
+    # the question entirely, and the answer written to .env is what the build reads.
+    if (-not $SearchEgress) {
+        if (Ask-Yes "May the bot's web search send queries off this machine?" $true) {
+            $SearchEgress = "true"
+        } else {
+            $SearchEgress = "false"
+        }
+    }
+
+    # ---- the page: loopback, or reachable from your network? ----
+    # The page is the default door. Its token is minted into .env below and never
+    # echoed; web.host decides who can reach it.
+    if (-not $NoWeb -and $Ask -and -not $KeepConn -and -not $WantWeb -and -not $WebToken) {
+        # The menu above already answered this: no page picked and no token handed over
+        # means the page stays OFF - its bind, port and token are not asked for at all.
+        $NoWeb = $true
+        Write-Host "  page        : off (not selected above)"
+    } elseif ($NoWeb) {
+        Write-Host "  page        : disabled (-NoWeb)"
+    }
+    if (-not $NoWeb) {
+        # Ports below 1024 are a PRIVILEGE boundary: without Administrator the bind fails
+        # and the page is simply absent. Fall back here, with the reason, rather than
+        # leaving the host to discover it at first start.
+        $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+                   [Security.Principal.WindowsBuiltInRole]::Administrator)
+        if ($WebPort -lt 1024 -and -not $IsAdmin) {
+            Write-Warning "port $WebPort needs Administrator (ports below 1024 are privileged): using 8790."
+            Write-Warning "  re-run elevated, or pass -WebPort 8790 (or any port above 1024), if you really need $WebPort."
+            $WebPort = 8790
+        }
+        if (-not $WebHost) {
+            if (Ask-Yes "Should the page be reachable from other machines on your network?" $false) {
+                $WebHost = "0.0.0.0"
+            } else {
+                $WebHost = "127.0.0.1"
+            }
+        }
+        # The page's token: set your own here, or take the host's own (a redo keeps it)
+        # or a minted one. This question exists because the wizard used to be
+        # mint-or-nothing.
+        if (-not $WebToken -and $Ask) {
+            $WebToken = (Read-Secret "Web UI token (Enter = keep this host's own, or mint one)").Trim()
+            if ($WebToken -and $WebToken.Length -lt 12) {
+                Write-Warning "the page token you set is only $($WebToken.Length) characters; the token is the whole door on a LAN, so 16+ is the shape it deserves."
+            }
+        }
+        if ($WebHost -eq "0.0.0.0") {
+            Write-Host "  page        : 0.0.0.0`:$WebPort - any machine on your network can open it"
+            Write-Host "                the token travels in cleartext there, so trust the network"
+            # The bind needs no Administrator; the FIREWALL hole does. Windows Defender
+            # Firewall refuses inbound by default, so name the command that opens it.
+            Write-Host "  firewall    : if the page is unreachable, open the port once in an"
+            Write-Host "                ELEVATED PowerShell:"
+            Write-Host "                  New-NetFirewallRule -DisplayName 'tinycmdr page' -Direction Inbound -Protocol TCP -LocalPort $WebPort -Action Allow"
+            Write-Host "                or skip the firewall with a tunnel:"
+            Write-Host "                  ssh -N -L ${WebPort}:127.0.0.1:${WebPort} <user>@<this-box>"
+        } else {
+            Write-Host "  page        : $WebHost`:$WebPort - this machine only"
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  ---- about to install ----"
+    Write-Host ("  folder       : {0}" -f $InstallDir)
+    # the bot name is resolved later (a switch, fleet-defaults, then this machine's name), so
+    # the summary resolves it the same way or it prints a bare "@"
+    $nameNow = if ($BotName) { $BotName } else { $env:COMPUTERNAME.ToLower() }
+    $ways = @()
+    if ($WantChat) { $ways += "a Mattermost bot on $MattermostUrl as @$nameNow" }
+    if ($WantTg) {
+        $ways += if ($WantChat) { "a Telegram DM (only with --telegram)" } else { "a Telegram DM" }
+    }
+    Write-Host ("  how you talk : {0}" -f ($ways -join " and "))
+    Write-Host ("  model        : {0} at {1}" -f $Model, $ModelBaseUrl)
+    if ($ModelKey) { Write-Host "  model key    : given (.env, TINYCMDR_LLM_API_KEY)" }
+    if ($SearchEgress -eq "true") {
+        Write-Host "  web search   : on, and may leave this machine"
+    } else {
+        Write-Host "  web search   : LAN only (an off-LAN provider is refused until allowed)"
+    }
+    Write-Host ""
+    if (-not (Ask-Yes "Install now?" $true)) {
+        Say "nothing was changed"
+        try { Stop-TranscriptRedacted } catch { }
+        exit 0
+    }
+}
+
+# resolve the bot token before touching anything: -MattermostToken, the secrets
+# file, a token file, an existing .env (so a -Force redo keeps it), then ask
+$tokenSource = ""
+if (-not $MattermostToken -and $secrets["TINYCMDR_MM_TOKEN"]) {
+    if ($MattermostTokenFile) {
+        $MattermostToken = (Get-Content $MattermostTokenFile -Raw).Trim()
+        $tokenSource = "the token file"
+    } else {
+        $MattermostToken = $secrets["TINYCMDR_MM_TOKEN"]
+        $tokenSource = "the secrets file"
+    }
+}
+if ($MattermostToken) {
+    $tokenSource = "the -MattermostToken switch"
+} elseif (-not $MattermostToken) {
+    if ($MattermostTokenFile) {
+        if (-not (Test-Path $MattermostTokenFile)) { Fail "no such token file: $MattermostTokenFile" }
+        $MattermostToken = (Get-Content $MattermostTokenFile -Raw).Trim()
+        $tokenSource = "file"
+    } elseif (Test-Path (Join-Path $InstallDir ".env")) {
+        foreach ($line in Get-Content (Join-Path $InstallDir ".env")) {
+            $s = $line.Trim()
+            if ($s -match '^TINYCMDR_MM_TOKEN=(.+)$' -and $matches[1].Trim()) {
+                $MattermostToken = $matches[1].Trim()
+                $tokenSource = "the existing .env (redo kept it)"
+                break
+            }
+        }
+    }
+    # $Ask, not -not $NoPause: the .cmd wrapper ALWAYS passes -NoPause (it only means
+    # "keep the window open"), so gating this on it never fired for a double-click, and
+    # a scripted -NonInteractive run hung here forever waiting for a token nobody was
+    # there to type. And -and $WantChat: a page-only install was asked for a Mattermost
+    # token it had just declined (measured 2026-10-08, on Windows - "I already skipped
+    # mattermost, why is this being presented?").
+    if (-not $MattermostToken -and $Ask -and $WantChat) {
+        $MattermostToken = Read-Secret "Mattermost bot token (blank = set it in .env later): "
+        if ($MattermostToken) { $tokenSource = "prompt" }
+    }
+}
+
+# The Telegram token gets the same redo treatment as the Mattermost one above. It used to
+# be filled only by the prompt, and the .env writer takes it from this variable - so a
+# redo (or the keep-existing path) wrote TINYCMDR_TG_TOKEN back EMPTY and silently dropped
+# the Telegram lane.
+if (-not $TelegramToken -and (Test-Path (Join-Path $InstallDir ".env"))) {
+    foreach ($line in Get-Content (Join-Path $InstallDir ".env")) {
+        $s = $line.Trim()
+        if ($s -match '^TINYCMDR_TG_TOKEN=(.+)$' -and $matches[1].Trim()) {
+            $TelegramToken = $matches[1].Trim()
+            break
+        }
+    }
+}
+
+# -------------------------------------------------------------------- the chat lane
+# A chat account is one reason the background task exists; the PAGE is the other. With
+# NO Mattermost and NO Telegram token, a lane-less install with the page on registers
+# the task and the page keeps it alive. Only -NoWeb on a lane-less box leaves a
+# files-only install (a task with nothing to serve would print the CLI-only guidance
+# and return, and a supervised task would respawn it every few seconds).
+$ChatLane = [bool]($MattermostToken) -and ($MattermostUrl -and $MattermostUrl -ne "CHANGE-ME.example.com")
+# Telegram is a chat lane too, and its token alone is enough: with no Mattermost token the
+# build runs the Telegram lane by itself, so a Telegram-only install NEEDS the background
+# task - otherwise it only answers while a window is open.
+$TgLane = [bool]($TelegramToken)
+$AnyLane = $ChatLane -or $TgLane
+# The page counts as something to serve, so it registers the task too.
+$Serve = $AnyLane -or (-not $NoWeb)
+$RegisterTask = (-not $SkipTask) -and $Serve
+
+# ---------------------------------------------------------------- 3. copy files
+Head "copying the app"
+if ($Force) {
+    # stop what is running from here first: the live process holds tinycmdr.log
+    # and tinycmdr.lock, so overwriting in place is what makes a redo messy
+    if (-not $SkipTask) { try { Stop-ScheduledTask -TaskName $AppName -ErrorAction SilentlyContinue } catch { } }
+    $n = Stop-TinycmdrProcesses -Dir $InstallDir
+    if ($n) { Say "stopped : $n running process(es) for a clean copy" }
+    Start-Sleep -Seconds 2
+}
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+# Everything the package carries is copied, minus the paths this host owns - the rule
+# update.sh applies. This used to be a hand-written list, and that list is a THIRD mirror
+# of "what ships": the new page design added assets/ to the package, the list was never
+# told, and every fresh install served /page.css as a 404 - the page rendered as raw
+# unstyled markup. One rule now.
+$hostFiles = @("config.json", ".env", "soul.md", "notes.md", "notes-authored.json",
+               "field-notes.md", "atlas.md", "experiments.jsonl", "web-sessions.json",
+               "state.json", "jobs.json", "tasks.json", "tasks.journal.jsonl", "tasks.md",
+               "confirm-allow.json", "tools-provenance.json", "theme.toml",
+               "tinycmdr.log", "tinycmdr.lock")
+# The one host-owned rule: keep in step with tinycmdr.py's _HOST_OWNED_PREFIXES and
+# the other two installers - four copies, already drifted once (snapshots/, tmp/);
+# Tests/test_verbs.py grades the coverage.
+$hostDirs  = @("tools", "skills", "sessions", "snapshots", "logs", "spill", "venv",
+               "dist", ".git", "tmp")
+$copied = 0
+foreach ($f in (Get-ChildItem -Path $Source -Recurse -File)) {
+    $rel = $f.FullName.Substring($Source.Length).TrimStart('\', '/')
+    $top = ($rel -split '[\\/]')[0]
+    if (($hostFiles -contains $top) -or ($hostDirs -contains $top)) { continue }
+    $dest = Join-Path $InstallDir $rel
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+    Copy-Item $f.FullName $dest -Force
+    $copied++
+}
+# The starter drop-ins seed a FRESH install and never overwrite the operator's own.
+foreach ($seed in @("tools", "skills")) {
+    $from = Join-Path $Source $seed
+    if (-not (Test-Path $from)) { continue }
+    $to = Join-Path $InstallDir $seed
+    New-Item -ItemType Directory -Force -Path $to | Out-Null
+    foreach ($f in (Get-ChildItem -Path $from -Recurse -File)) {
+        $d = Join-Path $to $f.FullName.Substring($from.Length).TrimStart('\', '/')
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $d) | Out-Null
+        if (-not (Test-Path $d)) { Copy-Item $f.FullName $d }
+    }
+}
+$stateDirs = @("sessions", "snapshots", "tools", "tmp")
+foreach ($d in $stateDirs) { New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir $d) | Out-Null }
+Say "copied  : $copied file(s) from the package (assets included)"
+
+# ------------------------------------------- 4. its own python + dependencies
+# The dependencies go into a virtual environment INSIDE the install folder rather
+# than into whatever python the machine happens to have. One install then owns its
+# stack, nothing else on the box can break it by upgrading a shared package, and
+# no administrator rights are involved - the folder is the reader's own.
+# A pre-existing venv is REUSED, so a -Force redo does not re-download anything.
+Head "python environment"
+$venvDir = Join-Path $InstallDir "venv"
+$venvPy  = Join-Path $venvDir "Scripts\python.exe"
+if (-not (Test-Path $venvPy)) {
+    Say "creating : $venvDir"
+    $null = Invoke-Py $py.Path -m venv $venvDir
+}
+if (Test-Path $venvPy) {
+    Say "python   : $venvPy"
+} else {
+    # A venv can fail to build (a store python, a locked-down temp folder). The
+    # install still works - the dependencies then go into the interpreter found
+    # above - so say so and carry on instead of stopping the reader here.
+    Say "note     : could not build a virtual environment - dependencies will go into"
+    Say "           $($py.Path) itself"
+    $venvPy = $py.Path
+}
+# A python whose ensurepip never ran has no pip at all, and then every install
+# below fails for a reason that is not the reader's fault.
+if (-not (Test-PyImport $venvPy "pip")) {
+    Say "pip      : missing - bootstrapping with ensurepip"
+    $null = Invoke-Py $venvPy -m ensurepip --upgrade
+}
+$reqFile = Join-Path $InstallDir "requirements.txt"
+$missing = @()
+foreach ($mod in @("requests", "mmpy_bot", "croniter")) {
+    if (-not (Test-PyImport $venvPy $mod)) { $missing += $mod }
+}
+if ($missing.Count) {
+    Say "deps     : installing $($missing -join ', ')  (needs internet/PyPI)"
+    $pipArgs = @("-m", "pip", "install", "--quiet", "--disable-pip-version-check")
+    if (Test-Path $reqFile) { $pipArgs += @("-r", $reqFile) }
+    else { $pipArgs += @("requests", "mmpy_bot", "croniter") }
+    $pipOut = Invoke-Py $venvPy @pipArgs
+    if ((-not (Test-PyImport $venvPy "requests")) -or (-not (Test-PyImport $venvPy "mmpy_bot"))) {
+        Write-Host (($pipOut.Trim() -split "`n" | Select-Object -Last 8) -join "`n")
+        Fail ("could not install the dependencies (requests, mmpy_bot) into $venvPy - " +
+              "pip's output is above. Check internet/proxy access, then re-run.")
+    }
+    if (-not (Test-PyImport $venvPy "croniter")) {
+        Say "deps     : croniter still missing - the schedule tool will be disabled"
+    }
+    Say "deps     : installed"
+} else {
+    Say "deps     : requests, mmpy_bot, croniter present"
+}
+# Everything below - the hidden launcher, the autostart entry and the probe - runs
+# the bot with this interpreter.
+$py = @{ Path = $venvPy; Version = $py.Version }
+
+# ------------------------------------------------------ the verb surface on PATH
+# An install left no command behind, so day-two work meant hand-editing
+# .env and config.json. tinycmdr.cmd is the shim; the folder goes on the USER path
+# (never the machine path), written straight into HKCU\Environment so nobody else's
+# %VAR% entries are frozen. Only -NoPath withholds it: -SkipTask is documented as
+# "files only: no autostart, no service", and it used to swallow the PATH entry too,
+# leaving an install with no `tinycmdr` verb attached.
+if ($NoPath) {
+    Say "path    : left alone (-NoPath)"
+} else {
+    if (Test-UserPathHas $InstallDir) {
+        Say "path    : already on your user PATH: tinycmdr status"
+    } else {
+        Set-UserPathRaw (((Get-UserPathParts) + $InstallDir) -join ';')
+        Send-EnvBroadcast
+        Say "path    : added to your user PATH - open a NEW window and run: tinycmdr status"
+    }
+    # ...and make it work in THIS window too: a user who just ran the install (or the
+    # one-liner) wants to type `tinycmdr` right away, and the registry write plus the
+    # broadcast only reach windows opened later. Process-local, nothing else touched.
+    if ($env:Path -notlike ("*" + $InstallDir + "*")) {
+        $env:Path = $env:Path.TrimEnd(';') + ';' + $InstallDir
+    }
+}
+
+# The host field is the HOST alone: a reader pastes what their browser shows
+# ("https://chat.example.com/"), while the scheme and the port are their own keys. Split
+# what came in rather than writing a url no client can build a request from (measured
+if ($MattermostUrl) {
+    $raw = $MattermostUrl
+    $h = ($raw -replace '^[a-zA-Z][a-zA-Z0-9+.-]*://', '')
+    if ($h -match '/') { $h = ($h -split '/')[0] }
+    if ($h -match '@') { $h = $h.Substring($h.LastIndexOf('@') + 1) }
+    if ($h -match '^(?<host>\[[^\]]+\]|[^:]+):(?<port>\d+)$') {
+        $h = $Matches['host']
+        $MattermostPort = [int]$Matches['port']
+    }
+    if ($h -ne $raw) { Say "mm url  : $raw -> $h (host field, port $MattermostPort)" }
+    $MattermostUrl = $h
+}
+
+# --------------------------------------------------------------- 4. config.json
+Head "writing config.json"
+$cfgPath = Join-Path $InstallDir "config.json"
+# The HOST's own config is the base whenever there is one. This used to copy the
+# package's config.example.json over it on EVERY run, so a plain re-run - and an
+# update with -Force - replaced a working install's settings with the example's
+# placeholders (mattermost.url, allowed_users, the model endpoint) and the bot
+# could not start. Measured 2026-09-24 on macOS, where an in-place update did
+# exactly that and had to be repaired by hand.
+$cfgFresh = -not (Test-Path $cfgPath)
+$cfgBase = if ($cfgFresh) { Join-Path $InstallDir "config.example.json" } else { $cfgPath }
+if (-not $BotName) {
+    $BotName = ($env:COMPUTERNAME).ToLower()          # host-style short name
+}
+if (-not $MattermostUrl) { $MattermostUrl = "CHANGE-ME.example.com" }
+
+if (-not (Test-Path $cfgBase)) {
+    Fail "no config.json and no config.example.json in $InstallDir"
+}
+$cfg = Get-Content $cfgBase -Raw | ConvertFrom-Json
+# Only what this run was TOLD. An update passes no -AllowedUser and no -ModelBaseUrl,
+# and re-applying the shipped defaults over a working host is what emptied an
+# allowlist (a bot that ignores every DM) and moved a LAN endpoint to loopback.
+if ($MattermostUrl -and $MattermostUrl -ne "CHANGE-ME.example.com") {
+    $cfg.mattermost.url = $MattermostUrl
+} elseif (-not $cfg.mattermost.url) {
+    $cfg.mattermost.url = "CHANGE-ME.example.com"
+}
+if ($MattermostPort -and $MattermostPort -ne 443) { $cfg.mattermost.port = $MattermostPort }
+$cfg.mattermost.token = ""
+if ($AllowedUser) { $cfg.mattermost.allowed_users = @($AllowedUser) }
+elseif ($cfgFresh) {
+    # The example's allowlist is a PLACEHOLDER ("REPLACE_WITH_YOUR_MATTERMOST_USER_ID").
+    # Left in place it made a fresh, page-only install look like a Mattermost host: the
+    # harness read it as intent and refused to start ("no Mattermost bot token"), so the
+    # page never came up (measured 2026-10-08 on Windows; the macOS and Linux installers
+    # drop the placeholder already).
+    $cfg.mattermost.allowed_users = @()
+}
+if ($ModelBaseUrlGiven) {
+    $cfg.llm.base_url = $ModelBaseUrl
+} elseif ($cfgFresh) {
+    $cfg.llm.base_url = "http://127.0.0.1:8081/v1"
+}
+if ($ModelGiven -or $cfgFresh) { $cfg.llm.model = $Model }
+if ($CloudFallback) { $cfg.llm.allow_cloud_fallback = $true }
+if ($ModelKey) {
+    # The PRIMARY's key goes to .env as TINYCMDR_LLM_API_KEY (env_map resolves it into
+    # llm.api_key), never config.json: that is a file the agent reads into a prompt.
+    # Remove any copy an older install left here.
+    $cfg.llm.PSObject.Properties.Remove("api_key")
+}
+# Extra endpoints: llm.fallbacks, in order, tried when the primary fails. The list is
+# injected into the JSON below rather than serialized here, because ConvertTo-Json
+# renders a ONE-element array as a bare object - and the code iterates it as a list
+# (a lone object would iterate its keys instead).
+$fbJson = ""
+if ($script:Fallbacks.Count) {
+    $cfg.llm.fallbacks = @()
+    $list = @()
+    foreach ($fb in $script:Fallbacks) {
+        $e = [ordered]@{ base_url = $fb.Url }
+        if ($fb.Model) { $e["model"] = $fb.Model }
+        if ($fb.Alias) { $e["alias"] = $fb.Alias }
+        if ($fb.Key)   { $e["api_key_env"] = $fb.Env }
+        $list += [pscustomobject]$e
+    }
+    $fbJson = ($list | ConvertTo-Json -Depth 6)
+    if ($list.Count -eq 1) { $fbJson = "[`n$fbJson`n]" }
+} elseif ($cfgFresh) {
+    # config.example.json carries a placeholder fallback (api.example.com, with a key
+    # variable nobody has): a fresh install must not inherit an endpoint that does not
+    # exist. An update keeps whatever the host already had.
+    $cfg.llm.fallbacks = @()
+}
+# The third door. The TOKEN is .env-only (env_map resolves TINYCMDR_TG_TOKEN, and a copy
+# in config.json is ignored with a warning), so only the numeric allowlist goes in here.
+# The lane is deny-by-default: a token with no id refuses to start, which is why the
+# installer refuses to finish that way rather than leaving a bot that ignores every DM.
+# A redo keeps a working Telegram lane: the ids live in config.json, so read them back when
+# this run was not given -TelegramIds. Without this the guard below ("a token with no id")
+# refuses a perfectly configured install the moment the token is kept.
+if (-not $TelegramIds -and $TelegramToken -and $cfg.telegram -and $cfg.telegram.allowed_users) {
+    $TelegramIds = (@($cfg.telegram.allowed_users) -join ",")
+}
+$tgIds = @()
+if ($TelegramIds) {
+    $tgIds = @($TelegramIds -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })
+}
+if ($TelegramToken -and $tgIds.Count -eq 0) {
+    Fail "a Telegram token with no numeric id: that lane would ignore every DM. Message @userinfobot for your id and pass -TelegramIds 123456789"
+}
+if ($TelegramIds -and $tgIds.Count -eq 0) {
+    Fail "-TelegramIds needs numeric ids (message @userinfobot for yours): got '$TelegramIds'"
+}
+if (-not $cfg.PSObject.Properties['telegram']) {
+    $cfg | Add-Member -NotePropertyName telegram -NotePropertyValue ([pscustomobject]@{})
+}
+$cfg.telegram.token = ""
+if ($tgIds.Count -gt 0) { $cfg.telegram.allowed_users = @($tgIds) }
+$cfg.agent.bot_name       = $BotName
+# The page: ON unless -NoWeb. host/port change only when this run was TOLD them (a
+# switch, an answered question, or a fresh install) - a redo keeps the host's own bind.
+if (-not $cfg.PSObject.Properties['web']) {
+    $cfg | Add-Member -NotePropertyName web -NotePropertyValue ([pscustomobject]@{})
+}
+if (-not $cfg.web.PSObject.Properties['enabled']) {
+    $cfg.web | Add-Member -NotePropertyName enabled -NotePropertyValue $true
+}
+if (-not $cfg.web.PSObject.Properties['host']) {
+    $cfg.web | Add-Member -NotePropertyName host -NotePropertyValue "127.0.0.1"
+}
+if (-not $cfg.web.PSObject.Properties['port']) {
+    $cfg.web | Add-Member -NotePropertyName port -NotePropertyValue 8790
+}
+$cfg.web.enabled = (-not $NoWeb)
+if ($WebHost) { $cfg.web.host = $WebHost }
+if ($PSBoundParameters.ContainsKey('WebPort') -or $cfgFresh) { $cfg.web.port = $WebPort }
+# What the config actually says, for every summary below: on an update this run was
+# not told a host, and printing 127.0.0.1 over a kept 0.0.0.0 bind is the line a
+# reader would act on wrongly.
+if (-not $WebHost) { $WebHost = [string]$cfg.web.host }
+if (-not $PSBoundParameters.ContainsKey('WebPort') -and $cfg.web.port) { $WebPort = [int]$cfg.web.port }
+$cfg.agent.debug_dump_dir = ""
+
+# Write UTF-8 WITHOUT a BOM: PowerShell 5.1's Set-Content -Encoding UTF8 adds one,
+# and a BOM breaks json parsing (and a BOM'd token file breaks the HTTP auth header
+# by one invisible character). One-element arrays also collapse to a scalar in
+# ConvertTo-Json, so allowed_users is forced back to a list.
+$json = $cfg | ConvertTo-Json -Depth 20
+# One-element arrays collapse to a scalar in ConvertTo-Json, and an empty one becomes
+# null; both break an allowlist check (a string is compared character by character, and
+# `uid not in None` raises). Unconditional, so it covers the Telegram list too.
+$json = $json -replace '"allowed_users":\s*"(.*?)"', '"allowed_users": [ "$1" ]'
+$json = $json -replace '"allowed_users":\s*null', '"allowed_users": []'
+if ($fbJson) {
+    $json = [regex]::Replace($json, '(?s)("fallbacks"\s*:\s*)\[\s*\]',
+                             { param($m) $m.Groups[1].Value + $fbJson })
+}
+Write-Utf8NoBom $cfgPath $json
+$verify = Get-Content $cfgPath -Raw | ConvertFrom-Json
+if ($verify.mattermost.allowed_users -is [string] -or $verify.telegram.allowed_users -is [string]) {
+    Fail "config.json allowed_users came out as a string, not a list - refusing to install a broken allowlist"
+}
+Say "bot name: $BotName"
+Say "model   : $Model @ $ModelBaseUrl"
+Say "mm url  : $MattermostUrl`:$MattermostPort"
+# Loopback is the neutral default for a package that must not ship any one host's
+# address - but it silently only works if a model runs on THIS machine. Say so,
+# and list it as an outstanding item rather than pretending it is configured.
+$LoopbackModel = $ModelBaseUrl -match "://(127\.0\.0\.1|localhost|\[::1\])"
+if ($LoopbackModel) {
+    Say "NOTE    : llm.base_url is LOOPBACK - only right if a model runs on this"
+    Say "          machine. For a model elsewhere, pass -ModelBaseUrl"
+    Say "          http://<model-host>:8081/v1 (or edit it in config.json)"
+}
+if ($ChatLane) {
+    if ($MattermostUrl -eq "CHANGE-ME.example.com") { Say "NOTE    : edit $cfgPath (mattermost.url) before the bot will connect" }
+    if (-not $AllowedUser) { Say "NOTE    : add your Mattermost user id to mattermost.allowed_users, or the bot ignores your DMs" }
+    if ($TgLane) { Say "tg lane : a Telegram token is set too - this process serves both"
+                   Say "          Mattermost and Telegram, no second process needed" }
+} elseif ($TgLane) {
+    Say "tg lane : Telegram only - allowlist $($tgIds -join ', '), starts by itself"
+} else {
+    Say "NOTE    : no chat account - mattermost.url and allowed_users are unused for now,"
+    Say "          and two local doors already work (see the summary below)"
+}
+
+# ---------------------------------------------------------------------- 5. .env
+Head "writing .env"
+$envPath = Join-Path $InstallDir ".env"
+# A model key is per bot, never fleet-wide. Keep whatever this host's .env already
+# holds (the template is about to replace the file), and never take one from
+# $SecretsFile: that is how several hosts ended up sharing one provider key, and
+# every one of them then showed the others' usage in that provider's dashboard.
+# No provider is named here on purpose - the key is whatever the endpoint issued.
+$ownKeys = @{}
+$EnvWebToken = ""
+if (Test-Path $envPath) {
+    foreach ($line in (Get-Content $envPath)) {
+        if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)=(.+)$') {
+            $k = $matches[1]
+            $v = $matches[2].Trim()
+            # Only the keys THIS INSTALL owns are withheld. The search keys were in
+            # this list too, so a re-run without -SecretsFile dropped a working
+            # host's TAVILY/ANYSEARCH keys - the same loss the config writer had,
+            # one file over. The primary's
+            # key is withheld only when THIS run resolved one; otherwise the host's
+            # own TINYCMDR_LLM_API_KEY line is carried over like any other.
+            $managed = @("TINYCMDR_MM_TOKEN", "TINYCMDR_TG_TOKEN", "TINYCMDR_WEB_TOKEN")
+            if ($ModelKey) { $managed += "TINYCMDR_LLM_API_KEY" }
+            if ($k -eq "TINYCMDR_WEB_TOKEN") {
+                # Kept if this host has one; a redo never rotates it silently - and a
+                # -WebToken / the wizard's answer outranks it (the priority below).
+                $EnvWebToken = $v
+                continue
+            }
+            if ($v -and ($managed -notcontains $k)) {
+                $ownKeys[$k] = $v
+            }
+        }
+    }
+}
+# Priority: -WebToken / the wizard's answer replaces the host's; else the host's own (a
+# redo never rotates it silently); else minted here.
+if (-not $WebToken) { $WebToken = $EnvWebToken }
+if (-not $WebToken) {
+    # Minted HERE and never echoed (the 1.0.24 lesson: a token in the install
+    # transcript is a leaked token). 32 random bytes, base64url - the same shape
+    # `tinycmdr token set TINYCMDR_WEB_TOKEN` mints.
+    $bytes = New-Object byte[] 32
+    ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($bytes)
+    $WebToken = ([Convert]::ToBase64String($bytes)).TrimEnd('=').Replace('+','-').Replace('/','_')
+    Say "minted  : TINYCMDR_WEB_TOKEN (the page's access token; it is in .env, never echoed here)"
+}
+Copy-Item (Join-Path $InstallDir ".env.example") $envPath -Force
+$envText = Get-Content $envPath -Raw
+$written = @()
+$refused = @()
+foreach ($key in @("TINYCMDR_MM_TOKEN", "TINYCMDR_TG_TOKEN", "TINYCMDR_WEB_TOKEN", "TINYCMDR_LLM_API_KEY", "TAVILY_API_KEY", "ANYSEARCH_API_KEY")) {
+    $val = ""
+    if ($key -eq "TINYCMDR_MM_TOKEN") { $val = $MattermostToken }
+    elseif ($key -eq "TINYCMDR_TG_TOKEN") { $val = $TelegramToken }
+    elseif ($key -eq "TINYCMDR_WEB_TOKEN") { $val = $WebToken }
+    elseif ($key -eq "TINYCMDR_LLM_API_KEY") { $val = $ModelKey }
+    else { $val = $secrets[$key] }
+    if (-not $val) { continue }
+    if ($val -match '^\s*<.*>\s*$' -or $val -match '(?i)redacted') {
+        # A redacted package or secrets file carries no real key. Writing the
+        # placeholder looks like success and then 401s at every search, so leave
+        # the key unset and say so.
+        $refused += $key
+        continue
+    }
+    # write into the commented template line, or append if there is none. The value is
+    # substituted LITERALLY: `-replace` reads its replacement as a regex
+    # template, so a token containing $$/$&/$'/` mangled itself on the way into .env -
+    # and the summary then printed a token the service rejected.
+    if ($envText -match "(?m)^#?\s*$key=") {
+        $envText = [regex]::Replace($envText, "(?m)^#?\s*$key=.*$", { param($m) "$key=$val" })
+    } else {
+        $envText = $envText.TrimEnd() + "`n$key=$val`n"
+    }
+    $written += $key
+}
+# Everything else this host already had goes back in: a redo must never lose a key.
+foreach ($k in @($ownKeys.Keys)) {
+    $v = $ownKeys[$k]
+    if ($envText -match "(?m)^#?\s*$k=") {
+        $envText = [regex]::Replace($envText, "(?m)^#?\s*$k=.*$", { param($m) "$k=$v" })
+    } else {
+        $envText = $envText.TrimEnd() + "`n$k=$v`n"
+    }
+    $written += "$k (this host's own)"
+}
+# The extra endpoints' keys. The carry-over above already put any older line in place,
+# so this REPLACES it rather than writing a second one for the same name.
+foreach ($fb in $script:Fallbacks) {
+    if (-not $fb.Key) { continue }
+    $k = $fb.Env
+    if ($envText -match "(?m)^#?\s*$k=") {
+        $envText = [regex]::Replace($envText, "(?m)^#?\s*$k=.*$", { param($m) "$k=$($fb.Key)" })
+    } else {
+        $envText = $envText.TrimEnd() + "`n$k=$($fb.Key)`n"
+    }
+    $written += "$k (extra endpoint)"
+}
+# The web-search consent, when this run has an opinion: "" is "leave this host's own",
+# and the carry-over above has already put a host's own line back. Written AFTER that
+# carry-over on purpose - the host's older line must not replace this run's answer, or an
+# install told "yes" still comes out refusing an off-LAN provider. The value is the
+# true|false text the build reads into search.allow_cloud_egress.
+if ($SearchEgress) {
+    $k = "TINYCMDR_SEARCH_EGRESS"
+    if ($envText -match "(?m)^#?\s*$k=") {
+        $envText = [regex]::Replace($envText, "(?m)^#?\s*$k=.*$", { param($m) "$k=$SearchEgress" })
+    } else {
+        $envText = $envText.TrimEnd() + "`n$k=$SearchEgress`n"
+    }
+    $written += $k
+}
+# And say what was NOT copied, without naming any provider: a model key belongs to
+# one host, and silently sharing it is how one box's usage appeared on another.
+$notCopied = @($secrets.Keys | Where-Object {
+        @("TINYCMDR_MM_TOKEN", "TINYCMDR_TG_TOKEN", "TAVILY_API_KEY",
+          "ANYSEARCH_API_KEY") -notcontains $_ })
+if ($notCopied.Count) {
+    Say "NOTE    : not copied from the secrets file: $($notCopied -join ', ')"
+    Say "          a model key is per host - put this host's own in $envPath by hand"
+}
+Write-Utf8NoBom $envPath $envText
+if ($written.Count) {
+    Say "env     : $($written -join ', ') written"
+    if ($MattermostToken) { Say "          (bot token from $tokenSource)" }
+} else {
+    if ($ChatLane) {
+        Say "NOTE    : no keys to write - put the bot token in $envPath (TINYCMDR_MM_TOKEN=...)"
+    } elseif (-not $TgLane) {
+        Say "env     : no chat token - none needed for the two local doors"
+    }
+}
+if ($refused.Count) {
+    Say "WARNING : refused redacted placeholder value(s): $($refused -join ', ')"
+    Say "          that file carried no real key - edit $envPath with the real values"
+}
+if (-not $secrets["TAVILY_API_KEY"] -and -not $secrets["ANYSEARCH_API_KEY"]) {
+    # Not a failure, and it used to be described as one: with no key anysearch still
+    # answers on its anonymous tier - off this machine and rate-limited, which is the
+    # reason search.allow_cloud_egress exists and defaults to false. The old line said
+    # "web search will be unavailable on this host", which is not what the code does.
+    Say "          no search key set: web_search uses anysearch's anonymous tier"
+    Say "          (off this machine, rate-limited) whenever search.allow_cloud_egress"
+    Say "          allows off-LAN search. A key, or a provider on this LAN, makes it"
+    Say "          reliable - see -SearchEgress above."
+}
+
+# --------------------------------------------------------- 6. launcher + service
+Head "writing launcher"
+# pythonw keeps a window from appearing; fall back to python.exe if pythonw is absent
+$pywPath = Join-Path (Split-Path $py.Path) "pythonw.exe"
+if (-not (Test-Path $pywPath)) { $pywPath = $py.Path }
+# This file is kept PURE ASCII by construction: its folder comes from
+# WScript.ScriptFullName and the only absolute path left is the interpreter fallback.
+# When that path itself is not ASCII - a python under a profile whose name is not ASCII -
+# the ASCII encoder below would mangle it exactly the way it used to mangle the install
+# folder, so let WSH resolve the bare name through PATH instead: that is where the
+# installer's own python.org install puts it.
+$vbsPyFallback = $pywPath
+if ($vbsPyFallback -notmatch '^[\x20-\x7e]+$') {
+    $vbsPyFallback = Split-Path -Leaf $pywPath
+    Say "NOTE    : the interpreter path is not ASCII - the hidden launcher will find"
+    Say "          $vbsPyFallback on PATH instead of baking the path into the script"
+}
+$vbs = @"
+' Launches the tinycmdr SUPERVISOR hidden (no console window) and WAITS for it.
+' Started by the logon shortcut (or by the scheduled task when -AsService was
+' used). Run by hand:
+'   wscript //B //Nologo tinycmdr-service.vbs
+'
+' The wait is load-bearing, and so is running the supervisor rather than the bot:
+'   * running tinycmdr.py directly exits at once, so the task always looked
+'     "Ready" even while the bot was dead;
+'   * while the supervisor runs, the task shows Running - that is what tells the
+'     operator, and Task Scheduler, that a bot is alive.
+' The supervisor is what brings the bot back here: at once on exit 75 (a /restart)
+' and with a growing backoff after a crash. Windows has no per-user service manager;
+' on Linux and macOS systemd's Restart=always and launchd's KeepAlive are the
+' watchdog, which is why this file ships with the Windows installer only.
+'
+' The folder comes from WScript.ScriptFullName, not from an absolute path pasted in:
+' the install folder used to be written through an ASCII encoder, so a
+' folder whose path holds a non-ASCII name came out with that name replaced by ? and
+' the autostart was dead on the next reboot while the installer still reported success.
+' Nothing but the interpreter fallback is absolute now, so the file stays ASCII wherever
+' it lands.
+Dim fso, sh, here, py
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set sh  = CreateObject("WScript.Shell")
+here = fso.GetParentFolderName(WScript.ScriptFullName)
+sh.CurrentDirectory = here
+py = here & "\venv\Scripts\pythonw.exe"
+If Not fso.FileExists(py) Then py = "$vbsPyFallback"
+sh.Run """" & py & """ """ & here & "\tinycmdr-supervise.py""", 0, True
+"@
+# ASCII on purpose: the text above is path-free by construction, so a non-ASCII profile
+# name cannot reach the encoder to be destroyed.
+Set-Content (Join-Path $InstallDir "tinycmdr-service.vbs") $vbs -Encoding ASCII
+
+$bat = @"
+@echo off
+rem tinycmdr launcher - double-click to start with a console window you can watch.
+rem Auto-start is handled by the Startup shortcut (or the scheduled task "$AppName" on
+rem an -AsService install); this file is for manual runs.
+rem
+rem %~dp0 is THIS file's own folder, so no absolute path is baked into the text. The
+rem installer used to interpolate the install folder and write it through an ASCII
+rem encoder, so a folder whose path holds a non-ASCII name came out with that name
+rem replaced by ? - a launcher pointing at a folder that never existed.
+setlocal
+cd /d "%~dp0"
+set "PY=%~dp0venv\Scripts\python.exe"
+if exist "%PY%" goto :run
+rem No venv (the documented fallback install): the dependencies went into a machine
+rem python, so look that one up - skipping the Microsoft Store stub on PATH, the same
+rem trap tinycmdr.cmd skips.
+set "PY="
+call :findpy python.exe
+if not defined PY call :findpy py.exe
+if not defined PY (
+    echo tinycmdr: no python on PATH - re-run the installer. 1>&2
+    exit /b 127
+)
+:run
+"%PY%" "%~dp0tinycmdr.py" %*
+exit /b %ERRORLEVEL%
+
+:findpy
+for /f "delims=" %%I in ('where %~1 2^>nul') do (
+    echo(%%I| findstr /i /c:"WindowsApps" >nul
+    if errorlevel 1 if not defined PY set "PY=%%I"
+)
+exit /b 0
+"@
+Set-Content (Join-Path $InstallDir "launch_tinycmdr.bat") $bat -Encoding ASCII
+Say "wrote   : tinycmdr-service.vbs, launch_tinycmdr.bat"
+
+# Secrets lockdown (security review 2026-09-23): .env holds the bot token, the
+# web token and provider keys, and the folder holds sessions and notes. Without
+# this they sit at the inherited folder ACL - readable by anything running as
+# this user or as an admin. Keep the install to this user, Administrators and
+# SYSTEM (the scheduled task runs as this same user). SIDs, not names:
+# BUILTIN\Administrators is localized on non-English Windows.
+try {
+    icacls $InstallDir /inheritance:r /grant:r `
+        "$($env:USERNAME):(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" `
+        | Out-Null
+    Say "acl     : $InstallDir locked to $env:USERNAME, Administrators, SYSTEM"
+} catch {
+    Say "NOTE    : could not tighten the ACL on $InstallDir ($($_.Exception.Message))"
+}
+
+# --------------------------------------------------------- 7. starting it up
+# Two ways, and the DEFAULT one needs no administrator rights at all:
+#   * a shortcut in your own Startup folder - starts at logon, in your session.
+#     This is what a plain install gets.
+#   * a scheduled task (-AsService) - starts at BOOT, before anyone logs in.
+#     Windows reserves boot-start tasks for administrators, so only that one
+#     needs an elevated shell. Nothing else in this installer does.
+if (-not $SkipTask -and -not $RegisterTask) {
+    Head "autostart: skipped"
+    Say "no chat account and -NoWeb, so there is nothing to keep running in the background."
+    Say "A host with neither a chat token nor the page has only these doors, from a shell:"
+    Say "  python tinycmdr.py --app                (the session, full screen)"
+    Say "  python tinycmdr.py --cli                (the same session, inline cards)"
+    Say "  python tinycmdr.py --once `"<task>`"     (one task, then exit)"
+    Say "Add a chat account later - re-run with -MattermostTokenFile <file>, or"
+    Say "  -TelegramToken <token> -TelegramIds <your numeric id>"
+}
+if ($RegisterTask -and -not $AsService) {
+    Head "starting it at logon (no admin needed)"
+    $startupDir = Split-Path -Parent $StartupLink
+    New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
+    try {
+        # A shortcut rather than a copied script: one owner for the launcher, and
+        # removing one file undoes the autostart. wscript.exe runs the hidden
+        # launcher with no console window.
+        $ws  = New-Object -ComObject WScript.Shell
+        $lnk = $ws.CreateShortcut($StartupLink)
+        $lnk.TargetPath        = Join-Path $env:SystemRoot "System32\wscript.exe"
+        $lnk.Arguments         = "//B //Nologo `"$InstallDir\tinycmdr-service.vbs`""
+        $lnk.WorkingDirectory  = $InstallDir
+        $lnk.Description       = "tinycmdr ($AppName) - hidden background agent"
+        $lnk.Save()
+        Say "startup : $StartupLink"
+        Say "          starts hidden at your next logon (delete that shortcut to stop it)"
+    } catch {
+        Say "NOTE    : could not write the Startup shortcut ($($_.Exception.Message))"
+        Say "          start it by hand instead: $InstallDir\launch_tinycmdr.bat"
+    }
+}
+if ($RegisterTask -and $AsService) {
+    Head "registering the scheduled task"
+    $action = New-ScheduledTaskAction -Execute "wscript.exe" `
+                -Argument "//B //Nologo ""$InstallDir\tinycmdr-service.vbs"""
+    # Which account the task runs as. "$env:USERDOMAIN\$env:USERNAME" is WRONG on a
+    # machine that is not in a domain: USERDOMAIN is "WORKGROUP", which does not
+    # resolve, and Register-ScheduledTask dies with "No mapping between account names
+    # and security IDs was done" (measured on a fresh install on a Windows host in a
+    # workgroup, where the previous install used the bare account name and worked).
+    # Resolve a real account
+    # first: the domain only when there is one, then the machine name, then the bare
+    # user name, and prove each by translating it to a SID.
+    $acct = $null
+    $cands = @()
+    if ($env:USERDOMAIN -and $env:USERDOMAIN -ne "WORKGROUP") { $cands += "$env:USERDOMAIN\$env:USERNAME" }
+    $cands += "$env:COMPUTERNAME\$env:USERNAME"
+    $cands += $env:USERNAME
+    foreach ($c in $cands) {
+        try {
+            $null = (New-Object System.Security.Principal.NTAccount($c)).Translate([System.Security.Principal.SecurityIdentifier])
+            $acct = $c
+            break
+        } catch { }
+    }
+    if (-not $acct) { Fail "no account for the scheduled task resolves ($($cands -join ', '))" }
+    Say "account : $acct"
+
+    $tLogon = New-ScheduledTaskTrigger -AtLogOn -User $acct
+    $tLogon.Delay = "PT30S"                            # let the network/Docker settle first
+    $tBoot  = New-ScheduledTaskTrigger -AtStartup
+    $tBoot.Delay = "PT4M"
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+             -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) `
+             -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    $principal = New-ScheduledTaskPrincipal -UserId $acct `
+                   -LogonType S4U -RunLevel Limited              # headless: runs with or without a logon
+    try {
+        Register-ScheduledTask -TaskName $AppName -Action $action -Trigger @($tLogon, $tBoot) `
+            -Settings $set -Principal $principal -Force `
+            -Description "tinycmdr: Mattermost ops agent (@$BotName)" | Out-Null
+        Say "task    : $AppName registered (logon +30s, boot +4min, S4U)"
+    } catch {
+        Say "S4U registration failed ($($_.Exception.Message)) - falling back to interactive logon"
+        $principal = New-ScheduledTaskPrincipal -UserId $acct -LogonType Interactive
+        # The fallback used to be bare, so with $ErrorActionPreference = Stop an
+        # unelevated run (a fleet kit's as_service: true, a wrong account) hit the trap
+        # and printed "INSTALL FAILED", exit 2 - after the files, the venv, config.json
+        # and .env were already written. Catch it and say what to do instead.
+        try {
+            Register-ScheduledTask -TaskName $AppName -Action $action -Trigger @($tLogon, $tBoot) `
+                -Settings $set -Principal $principal -Force `
+                -Description "tinycmdr: Mattermost ops agent (@$BotName)" | Out-Null
+            Say "task    : $AppName registered (interactive - starts at your logon only)"
+        } catch {
+            Fail ("could not register the scheduled task '$AppName': $($_.Exception.Message)`n" +
+                  "Run this installer again from an elevated PowerShell (Run as Administrator)," +
+                  " or drop -AsService - a logon install needs no administrator rights.`n" +
+                  "The files are in $InstallDir; start it with launch_tinycmdr.bat.")
+        }
+    }
+}
+
+# ------------------------------------------------------------ 8. start + verify
+if ($RegisterTask -and -not $NoStart) {
+    Head "starting and verifying"
+    if ($AsService) {
+        Start-ScheduledTask -TaskName $AppName
+    } else {
+        # No task to start: run the very launcher the logon shortcut runs, so the
+        # install is proven now instead of at the next logon. wscript with //B has
+        # no console window, and this returns as soon as it is launched.
+        Start-Process -FilePath (Join-Path $env:SystemRoot "System32\wscript.exe") `
+            -ArgumentList "//B //Nologo `"$InstallDir\tinycmdr-service.vbs`""
+    }
+    Start-Sleep -Seconds 3
+    $probe = Invoke-Probe -Dir $InstallDir -Python $py.Path
+    Write-Host (($probe.Trim() -split "`n" | Select-Object -Last 6) -join "`n")
+    if ($probe -match "READY") {
+        Say "the agent answered - the app and the model endpoint both work"
+    } else {
+        Say "INSTALLED, BUT NOT VERIFIED: the probe did not get an answer."
+        Say "That is a configuration gap, not a broken install - the files and the"
+        Say "$(if ($AsService) { 'scheduled task' } else { 'logon shortcut' }) are in place."
+        Say "Set llm.base_url / llm.model in $cfgPath (and see the output above), then:"
+        if ($AsService) {
+            Say "  Stop-ScheduledTask $AppName; Start-ScheduledTask $AppName"
+        } else {
+            Say "  tinycmdr restart      (or stop and start it from the Startup shortcut)"
+        }
+        $Unverified = $true
+    }
+}
+
+Head "done - still to do"
+$todo = @()
+if ($TgLane -and -not $ChatLane) {
+    Say "This install answers Telegram DMs. The lane starts by itself (no Mattermost token"
+    Say "on this box), and the allowlist is $($tgIds -join ', ')."
+    Say ""
+    Say "  DM your bot and it answers; a group message is refused on purpose."
+    if (-not $RegisterTask) { Say "  NOTE   : no background task was registered (-SkipTask), so nothing is listening yet." }
+} elseif (-not $AnyLane -and -not $NoWeb) {
+    Say "This install has NO chat account: the PAGE is the door, and the background task"
+    Say "serves it. Open it from a browser on this machine:"
+    Say "  http://127.0.0.1:$WebPort"
+    if ($WebHost -eq "0.0.0.0") {
+        Say "  or from any machine on your network: http://<this-pc>:$WebPort"
+    }
+    Say "the tokenized link:  cd $InstallDir ; python tinycmdr.py web"
+    Say ""
+} elseif (-not $AnyLane) {
+    Say "This install has NO chat account and -NoWeb, a files-only install. Nothing"
+    Say "runs in the background and nothing remote is served; from a shell:"
+    Say ""
+    Say "  the app     :  cd $InstallDir ; python tinycmdr.py --app"
+    Say "  inline too  :  cd $InstallDir ; python tinycmdr.py --cli"
+    Say "  one task    :  cd $InstallDir ; python tinycmdr.py --once `"<task>`""
+    Say ""
+    Say "Add a Mattermost account whenever you want one:"
+    Say "  install-tinycmdr.cmd -Force -MattermostTokenFile <file with the token>"
+    Say "Add a Telegram DM whenever you want one:"
+    Say "  install-tinycmdr.cmd -Force -TelegramToken <token> -TelegramIds <your numeric id>"
+    Say ""
+}
+if (-not $MattermostToken) { $todo += "optional: Mattermost bot token -> $envPath  (TINYCMDR_MM_TOKEN=...)" }
+if (-not $AllowedUser)     { $todo += "optional: allowed_users -> $cfgPath  (your Mattermost user id)" }
+if ($MattermostUrl -eq "CHANGE-ME.example.com") { $todo += "optional: Mattermost server url -> $cfgPath  (mattermost.url)" }
+if ($LoopbackModel) { $todo += "model endpoint        -> $cfgPath  (llm.base_url - loopback right now)" }
+if ($todo.Count -eq 0 -and $ChatLane) { Say "nothing - this install is configured" }
+elseif (-not $ChatLane -and $todo.Count -eq 0) { Say "nothing required - a session (--cli) or a one-shot (--once) works now" }
+else { $n = 1; foreach ($t in $todo) { Say "$n. $t"; $n++ } }
+Say ""
+if ($todo.Count -gt 0 -and $RegisterTask) {
+    if ($AsService) {
+        Say "after editing, restart:  Stop-ScheduledTask $AppName; Start-ScheduledTask $AppName"
+    } else {
+        Say "after editing, restart:  tinycmdr restart   (or delete/restore the Startup shortcut)"
+    }
+}
+if ($todo.Count -gt 0 -and -not $RegisterTask) { Say "after editing, just start it:  cd $InstallDir ; python tinycmdr.py --app" }
+if ($RegisterTask -and -not $AnyLane -and -not $NoWeb) { Say "page    : http://127.0.0.1:$WebPort  (or a machine on your network when web.host is 0.0.0.0)"; Say "token   : in $envPath; 'python tinycmdr.py web' prints the link" }
+Say "logs: $InstallDir\tinycmdr.log"
+if ($Ask) {
+    if ($WantChat) { Say "DM the bot account on $MattermostUrl and it will answer." }
+    if ($WantCli) {
+        Say "a session needs nothing running:  cd $InstallDir ; python tinycmdr.py --app (or --cli)"
+        if (Ask-Yes "Open a session now?" $false) {
+            Say "starting a session - type your task, Ctrl-C to leave"
+            try { & $py.Path (Join-Path $InstallDir "tinycmdr.py") "--app" } catch { }
+        }
+    }
+    if ($WantTg) {
+        Say "DM your Telegram bot and it will answer."
+        if ($WantChat) { Say "  (both tokens are set: this one process serves Mattermost AND Telegram)" }
+    }
+    # The page counts: a page-only install keeps the agent running to serve it, and the
+    # old condition told that install "nothing selected ... does not run in the
+    # background" while the launcher it had just registered did exactly that (measured
+    # 2026-10-08 on Windows).
+    if (-not ($WantChat -or $WantTg -or $WantWeb -or $WantCli)) {
+        Say "nothing selected - the harness is installed and does not run in the background."
+    }
+}
+# The consent, restated where it matters: a reader who answered "no" (or said nothing)
+# must know an off-LAN provider is refused rather than broken, and how to change that
+# without a reinstall.
+if ($SearchEgress -eq "true") {
+    Say "web search: off-LAN allowed (search.allow_cloud_egress=true)"
+} else {
+    Say "web search: LAN only - an off-LAN provider is refused until"
+    Say "            search.allow_cloud_egress=true. A provider on this LAN never"
+    Say "            needs it: tinycmdr config set search.providers '<json>'"
+}
+Say "check  : $InstallDir> python tinycmdr.py --once ""/status""   (a session: --app, or --cli inline)"
+Say "redo   : install-tinycmdr.cmd -Force"
+# The wrapper is the line to give a reader: a stock Restricted execution
+# policy refuses the -File form, and the -File form used to hardcode the default folder
+# so a -InstallDir install could not be removed with it at all. Both wrappers pass
+# -InstallDir through, and both are in the install folder / the package. The door comes
+# first because it is the one a reader can double-click.
+Say ("uninstall: double-click {0}\UNINSTALL-WINDOWS.cmd" -f $InstallDir)
+Say ("           (or: {0}\install\install-tinycmdr.cmd -Uninstall -Force)" -f $InstallDir)
+Say "           (from an extracted package: INSTALL-WINDOWS.cmd -Uninstall -Force)"
+try { Stop-TranscriptRedacted } catch { }
+if (-not $NoPause) { Read-Host "`nPress Enter to close" }
+# 0 = installed and verified - 3 = installed, model endpoint not answering yet
+if ($Unverified) { exit 3 } else { exit 0 }
