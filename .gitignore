@@ -1,0 +1,109 @@
+# tinycmdr repo — what is source and what is per-host state.
+#
+# Rule: anything a host writes for itself (logs, sessions, memory files, secrets,
+# backups) never enters git. The same tree is deployed to many hosts, so a committed
+# per-host file would read as canonical and be wrong.
+
+# --- per-host state ---
+logs/
+sessions/
+spill/
+state.json
+# The operator's own theme and persona. The app seeds a missing one from the shipped
+# theme.default.toml / soul.example.md at first start, and the host's edited copy must
+# never be clobbered by an update - so neither is tracked.
+theme.toml
+soul.md
+*.bak*
+web-token.txt
+.env
+__pycache__/
+dist/
+# tools/ is per-host tool payload - with ONE exception: the starter tools
+# are shipped source (they ride every package), so they are tracked.
+tools/*
+!tools/patch.py
+!tools/process.py
+!tools/toolsmith.py
+!tools/computer_use.py
+!tools/README.md
+notes.md
+atlas.md
+knowledge/
+skills/.imported-unused/
+
+# --- more per-host state and scratch artifacts ---
+# Every name here is a file a host writes for itself, or a scratch artifact.
+field-notes.md
+# the field-note hit counters: per-host state, written on every failure the harness sees
+field-notes-hits.json
+notes-archive.md
+notes-authored.json
+# the confirm gate's approvals (per-host: what the operator told it to stop asking)
+confirm-allow.json
+tests/eval-runs/
+snapshots/
+tmp/
+uploads/
+.archive/
+.pre-*
+*.pre-*
+config.json
+jobs.json
+inbox/
+*.log
+# A rotated log keeps a numeric suffix, and `*` stops at the dot, so `git add -A` in a
+# live tree would commit a host log. Both names belong here for the same reason.
+*.log.*
+*.lock
+*.tmp
+skills/
+.env.*
+!.env.example
+web-token.txt.*
+web-sessions.json
+# the tools/ provenance record written at run start (ToolRegistry.note_provenance)
+tools-provenance.json
+a.txt
+lines.txt*
+
+# Host-specific operational tooling & notes
+maintenance/atlas-notes/
+# Engineering notes: they name hosts, addresses and the operator's
+# decisions, so they are never shipped and never committed.
+docs/dev-log.md
+docs/deferred-corrections.md
+maintenance/fleet-version-report.ps1
+maintenance/fleet-metrics.py
+maintenance/register-boot-recovery.ps1
+maintenance/start-containers.ps1
+maintenance/task-audit.ps1
+docs/handoff-*.md
+docs/staged-*.md
+# A pre-edit copy of a build: a whole build, not source, so it is a scratch
+# artifact.
+probe-pre.py
+launch_tinycmdr.bat
+tinycmdr-service.vbs
+
+# The private inventory (host names, ids, addresses, secret labels).
+# build-package.py refuses to build a public package without it.
+maintenance/private_rules.py
+
+# maintenance/where.py's per-host tree declaration: it names this box's own paths
+# (a backup share, an ops workspace), which are true of one machine and nobody else.
+maintenance/where-roles.json
+
+# --- common live-tree clutter: on a real host these show up as untracked, which
+# makes `git status` useless for spotting real drift.
+venv/
+.DS_Store
+.DS_Store?
+# --- more live-tree clutter, found by maintenance/where.py, for the same reason ---
+# experiments.jsonl is written by the run itself; the tool-audit folder is a
+# per-host evidence dump. Neither is source, and both make `git status` in a live
+# tree look dirty next to a REAL tracked modification - the two are told apart.
+experiments.jsonl
+maintenance/tool-audit-*/
+# the browser auto-open marker (one tab per token+port per window)
+.web-open
