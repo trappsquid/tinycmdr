@@ -1,0 +1,1314 @@
+"""Tests for the v1.9.3 check-ins: the model's own narration (interim_cb) and the
+harness-side per-tool lines (progress_done_cb).
+
+Run:  python tests/test_checkin.py            (the whole gate: python tests/run_all.py)
+Same shape as the other staged suites: imports the live tinycmdr.py as a module,
+redirects every file it writes into a temp dir, no Mattermost connection.
+"""
+import copy
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import atexit
+import shutil
+import time
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent.parent
+
+# This suite imports the bot build.
+SRC = BASE / os.environ.get("TINYCMDR_SRC", "tinycmdr.py")
+spec = importlib.util.spec_from_file_location("tinycmdr_checkin_under_test",
+                                              SRC)
+fb = importlib.util.module_from_spec(spec)
+sys.modules["tinycmdr_checkin_under_test"] = fb
+spec.loader.exec_module(fb)
+
+TMP = Path(tempfile.mkdtemp(prefix="fbcheckin-"))
+# Clean the scratch dir on exit: running the suites on a fresh host
+# should not leave a directory behind for every run.
+atexit.register(lambda: shutil.rmtree(TMP, ignore_errors=True))
+sys.path.insert(0, str(BASE / "tests"))
+import hermetic                                                          # noqa: E402
+
+# redirect_files() below covers the data files it knows, but the app also writes its
+# journal, its state files and the tools-provenance record beside itself, and it writes them
+# from code this suite does not name per test: run_all.py's leak report named
+# tasks.journal.jsonl and tools-provenance.json for this suite. Rebind all of them into TMP.
+hermetic.redirect_repo_files(fb, TMP)
+if not hasattr(fb, "ProgressReporter"):
+    # The chat lane's reporter factory exists only when this build has a chat
+    # layer (one reporter, lane destinations); there is nothing here to grade
+    # without it. Declared skip, not a green lie: exit 77 is what run_all.py counts
+    # as "this suite graded nothing", so it can never read as a pass.
+    print("skip: this suite grades the chat lane (ProgressReporter); "
+          "this build has none - run it against tinycmdr.py")
+    sys.exit(77)
+PRISTINE = copy.deepcopy(fb.CONFIG)
+FAILURES = []
+PASSES = []
+
+
+def check(name, cond, detail=""):
+    if cond:
+        PASSES.append(name)
+    else:
+        FAILURES.append(f"{name}: {detail}")
+        print(f"FAIL {name}: {detail}")
+
+
+def reset_config():
+    fb.CONFIG.clear()
+    fb.CONFIG.update(copy.deepcopy(PRISTINE))
+
+
+def redirect_files():
+    reset_config()
+    fb.NOTES_FILE = TMP / "notes.md"
+    fb.SESSIONS_DIR = TMP / "sessions"
+    fb.SESSIONS_DIR.mkdir(exist_ok=True)
+    fb.NOTES_FILE.write_text("", encoding="utf-8")
+
+
+class FakeDispatcher:
+    """Records _post/_edit instead of talking to Mattermost."""
+
+    def __init__(self):
+        self.posts = []
+        self.colors = []
+        self.ids = []
+        self.edits = []
+        self.edit_colors = []
+        self.deletes = []
+        self._n = 0
+
+    def _post(self, channel_id, root_id, text, color=None, draft_id=None):
+        if draft_id:
+            # what the real door does with a run's own streamed draft: edit it in place
+            self.edits.append((draft_id, channel_id, text))
+            self.edit_colors.append(color)
+            return draft_id
+        self._n += 1
+        pid = f"post{self._n}"
+        self.posts.append((channel_id, root_id, text))
+        self.colors.append(color)
+        self.ids.append(pid)
+        return pid
+
+    def _edit(self, post_id, channel_id, text, color=None):
+        self.edits.append((post_id, channel_id, text))
+        self.edit_colors.append(color)
+        return True
+
+    def _delete(self, post_id, channel_id):
+        self.deletes.append((post_id, channel_id))
+        return True
+
+
+def reporter(**cfg):
+    """A ProgressReporter on a fake dispatcher; the '🔧 Working…' line is dropped
+    so assertions see only what the check-ins add."""
+    redirect_files()
+    fb.CONFIG["agent"].update(cfg)
+    d = FakeDispatcher()
+    rep = fb.ProgressReporter(d, "chan", "root", "sess")
+    d.posts.clear()          # drop the '🔧 Working…' status line
+    d.ids.clear()
+    return d, rep
+
+
+# the previews and exit codes the harness reads off a tool call
+def test_tool_preview_takes_first_line():
+    prev = fb._tool_preview("shell", {"command": "Get-Item C:/x\nRemove-Item y"})
+    check("preview is the first line only", prev == "Get-Item C:/x", prev)
+    long_cmd = "x" * 500
+    prev = fb._tool_preview("shell", {"command": long_cmd}, limit=20)
+    check("preview is truncated", len(prev) <= 21 and prev.endswith("…"), prev)
+    prev = fb._tool_preview("read_file", {"path": "C:/a/b.txt"})
+    check("path tools preview the path", prev == "C:/a/b.txt", prev)
+    prev = fb._tool_preview("weird_tool", {"alpha": 1, "beta": 2})
+    check("other tools preview their args", prev == "alpha=1, beta=2", prev)
+
+
+def test_tool_preview_scrubs_secrets():
+    fb._SECRETS.add("HUNTER2SECRET")
+    try:
+        prev = fb._tool_preview("shell", "{\"command\": \"curl -H 'k: HUNTER2SECRET'\"}")
+    finally:
+        fb._SECRETS.discard("HUNTER2SECRET")
+    check("preview scrubs secrets", "HUNTER2SECRET" not in prev, prev)
+
+
+def test_exit_code_parsing():
+    check("exit_code=1 parsed", fb._exit_code("exit_code=1\nerr") == 1)
+    check("exit_code=0 parsed", fb._exit_code("exit_code=0\nok") == 0)
+    check("no exit code -> None", fb._exit_code("just output") is None)
+    check("None output is safe", fb._exit_code(None) is None)
+
+
+# the model's own narration
+def test_note_posts_its_own_message():
+    d, rep = reporter(checkin_note_min_seconds=0)
+    rep.note("Checking what holds the file lock:")
+    check("narration is one new message", len(d.posts) == 1, d.posts)
+    check("narration is marked and verbatim",
+          d.posts[0][2] == "💬 Checking what holds the file lock:", d.posts)
+    check("narration is threaded on the root", d.posts[0][1] == "root", d.posts)
+
+
+def test_note_throttle_and_cap():
+    d, rep = reporter(checkin_note_min_seconds=60)
+    rep.note("first")
+    rep.note("second — inside the throttle window")
+    check("throttled narration is dropped", len(d.posts) == 1, d.posts)
+    d, rep = reporter(checkin_note_chars=20, checkin_note_min_seconds=0)
+    rep.note("y" * 200)
+    check("narration is capped", len(d.posts[0][2]) <= 25, d.posts[0][2])
+
+
+# the harness-side tool lines
+def test_launch_warning_only_where_a_cap_exists():
+    """A model server started as a child joins THIS unit's cgroup, so its load kills
+    the agent (a bot account 17:09: 33.4 GiB inside tinycmdr.service)."""
+    cmd = "llama-server -m /mnt/models/x.gguf --host 0.0.0.0"
+    if not fb._self_mem_cap_mb():
+        check("no cgroup ceiling on this host -> no warning",
+              fb._launch_warning(cmd) == "", fb._launch_warning(cmd))
+    warned = fb._launch_warning(cmd, cap_mb=32768)
+    check("with a 32 GiB cap the launch is called out",
+          "CHILD of me" in warned and "systemd-run" in warned, warned)
+    plain = fb._launch_warning("mkdir -p /tmp/x && ls -la", cap_mb=32768)
+    check("an ordinary command is not warned about", plain == "", plain)
+
+
+def test_cgroup_memory_and_probe():
+    cg = fb._cgroup_mem_mb()
+    if fb.IS_WINDOWS or sys.platform == "darwin":
+        # Neither has cgroup accounting, and "unknown ceiling" is the honest answer.
+        check("no cgroup accounting on this platform", cg is None, cg)
+    else:
+        # These readers follow /proc/self/cgroup (before 2.5.19 they read the cgroup ROOT,
+        # which does not exist on a systemd host, so both were blind there). What matters is
+        # that the path resolved is THIS process's own scope, and that the number is never
+        # the whole machine's: in a plain shell the scope may expose accounting or not.
+        own = fb._own_cgroup_dir()
+        check("the memory readers follow this process's own cgroup, not the root",
+              bool(own) and own.startswith("/sys/fs/cgroup/") and own.count("/") >= 4, own)
+        check("and the figure is a scope's, never the whole box",
+              cg is None or cg < 8192, cg)
+    check("the memory probe stays off while the process is small",
+          fb._mem_probe() is None, fb._mem_probe())
+
+
+def test_checkin_shows_memory():
+    """The climb that ends in an OOM kill has to be visible in chat, not only in
+    journalctl after four kills (a bot account, 2026-09-19)."""
+    d, rep = reporter()
+    txt = rep.checkin_text(3, 61.0, "shell", {"command": "x"})
+    check("the periodic line carries RAM", "RAM" in txt, txt)
+    rss = fb._self_rss_mb()
+    check("this process's RSS is readable on this host",
+          bool(rss) and rss > 0, rss)
+    check("the line renders the ceiling when the OS exposes one",
+          fb.mem_line().startswith("RAM"), fb.mem_line())
+
+
+def test_scope_note_past_the_threshold():
+    """A vague order can run 30-58 tool calls with no operator-facing signal but the tool
+    lines themselves. One line, once per run,
+    past scope_note_steps - and nothing at all where nobody reads this lane."""
+    d, rep = reporter(scope_note_steps=40)
+    check("no scope note under the threshold", rep.scope_note(12, "shell") == "")
+    note = rep.scope_note(41, "shell")
+    check("the scope note names the count, the last tool and the verb that ends the run",
+          "41 tool calls" in note and "/tinycmdr stop" in note and "shell" in note, note)
+    check("and it fires only ONCE per run", rep.scope_note(80, "shell") == "")
+    d2, rep2 = reporter(scope_note_steps=40)
+    rep2.dest.has_human = False
+    check("silent on a lane with nobody to read it", rep2.scope_note(41, "shell") == "")
+    d3, rep3 = reporter(scope_note_steps=0)
+    check("0 switches it off entirely", rep3.scope_note(99, "shell") == "")
+    d4, rep4 = reporter(scope_note_steps=40)
+    d4.has_human = True
+    rep4.steps = 41
+    rep4.progress("shell", {"command": "x"})     # the check-in lives in progress()
+    body = "\n".join(x[2] for x in d4.posts) + "\n".join(x[2] for x in d4.edits)
+    check("the check-in path posts it without being asked", "still working" in body, body[:200])
+
+
+def test_tool_line_single_call():
+    d, rep = reporter()
+    rep.tool_done("shell", {"command": "Get-PSDrive C"}, "exit_code=0\nfree", 0.4)
+    check("one tool call -> one new message", len(d.posts) == 1 and not d.edits,
+          (d.posts, d.edits))
+    body = d.posts[0][2]
+    check("line names the tool and the result's first line",
+          "`shell`" in body and "free" in body, body)
+    check("the result card previews the output, not the command",
+          "Get-PSDrive C" not in body, body)
+    check("line shows the duration", "0.4s" in body, body)
+    check("exit 0 is not shouted about", "exit" not in body, body)
+
+
+def test_tool_line_flags_nonzero_exit():
+    d, rep = reporter()
+    rep.tool_done("shell", {"command": "rmdir release"}, "exit_code=1\nbusy", 2.6)
+    body = d.posts[0][2]
+    check("failed command shows its exit code", "[exit 1]" in body, body)
+
+
+def test_tool_line_shows_why_a_call_failed():
+    """A red line carrying only an exit code sends the operator to the host log to
+    find out what happened, which is the whole reason this exists."""
+    d, rep = reporter()
+    rep.tool_done("shell", {"command": "cat /etc/shadow"},
+                  "exit_code=1\ncat: /etc/shadow: Permission denied", 1.2)
+    body = d.posts[0][2]
+    check("a failure shows its reason", "Permission denied" in body, body)
+    check("the reason is shown once (preview == reason, not both)",
+          body.count("Permission denied") == 1, body)
+    check("the exit code stays", "[exit 1]" in body, body)
+
+
+def test_tool_result_previews_the_output():
+    """The operator's call (2026-09-22): the result card shows the first
+    line of the OUTPUT - the call card and the check-in already show the
+    command, so echoing it here repeated it and hid the one line that says
+    how the call went."""
+    d, rep = reporter()
+    rep.tool_done("shell", {"command": "ls"}, "exit_code=0\nlots of good output", 0.3)
+    body = d.posts[0][2]
+    check("a successful call previews its first output line",
+          "good output" in body, body)
+    check("a successful call gets no reason", " — " not in body, body)
+    d, rep = reporter()
+    rep.tool_done("shell", {"command": "ls"}, "exit_code=0", 0.3)
+    check("a result with no line falls back to the command",
+          "ls" in d.posts[0][2], d.posts[0][2])
+
+
+def test_the_failure_reason_is_one_clean_line():
+    snip = fb._failure_snippet("exit_code=2\nfirst real line\nsecond line")
+    check("the reason is the first real line", snip == "first real line", snip)
+    long_line = "x" * 400
+    snip = fb._failure_snippet("exit_code=1\n" + long_line)
+    check("a long reason is capped", len(snip) == 161 and snip.endswith("…"), len(snip))
+    snip = fb._failure_snippet("exit_code=1\nweird `tick` line\nmore")
+    check("backticks are stripped (the batch text is not a fence)",
+          "`" not in snip, snip)
+    fb._SECRETS.add("HUNTER3SECRET")
+    try:
+        snip = fb._failure_snippet("exit_code=1\nleaked HUNTER3SECRET here")
+    finally:
+        fb._SECRETS.discard("HUNTER3SECRET")
+    check("the reason is scrubbed", "HUNTER3SECRET" not in snip, snip)
+    check("clean output produces no reason at all",
+          fb._failed_call("just output")[1] == "", fb._failed_call("just output"))
+    check("empty output is safe", fb._failed_call(None)[1] == "", "raised or returned")
+
+
+def test_marker_failures_show_their_reason_too():
+    """Tools with no exit code still fail; the harness's own verdict words are the
+    signal, and they are exactly the cases where the reason matters."""
+    d, rep = reporter()
+    rep.tool_done("edit_file", {"path": "C:/x"}, "ERROR: path does not exist", 0.1)
+    check("a harness ERROR shows its reason",
+          "path does not exist" in d.posts[0][2], d.posts[0][2])
+    d, rep = reporter()
+    rep.tool_done("shell", {"command": "sleep 900"}, "TIMEOUT after 300s — killed", 300.2)
+    check("a TIMEOUT shows its reason",
+          "TIMEOUT after 300s" in d.posts[0][2], d.posts[0][2])
+
+
+def test_tool_lines_merge_into_one_message():
+    d, rep = reporter(checkin_tool_merge_seconds=60)
+    for i in range(3):
+        rep.tool_done("shell", {"command": f"step-{i}"}, "exit_code=0", 0.2)
+    check("a batch is ONE message", len(d.posts) == 1, d.posts)
+    check("the batch grows by edit", len(d.edits) == 2, d.edits)
+    final = d.edits[-1][2]
+    check("the batch counts its calls", "3 tool calls" in final, final)
+    check("every call is listed", all(f"step-{i}" in final for i in range(3)), final)
+    check("edits carry the same message id",
+          {e[0] for e in d.edits} == {d.ids[0]}, d.edits)
+
+
+def test_tool_lines_cap_starts_new_message():
+    d, rep = reporter(checkin_tool_merge_seconds=60, checkin_tool_max_lines=2)
+    for i in range(3):
+        rep.tool_done("shell", {"command": f"step-{i}"}, "exit_code=0", 0.2)
+    check("cap forces a second message", len(d.posts) == 2, d.posts)
+    check("second message starts a fresh batch", "step-2" in d.posts[1][2], d.posts[1][2])
+
+
+def test_the_checkin_line_scrubs_tool_args():
+    """A-2026-10-08-158: checkin_line built the ⏳ snippet from raw args and none of the
+    destinations scrubs, so a literal token in the first stretch of a command rode chat
+    and page every five minutes."""
+    fb._SECRETS.add("HUNTER-CHECKIN")
+    try:
+        line = fb.checkin_line("checkin-scrub", 3, 65.0, name="shell",
+                               args={"command": "export TOKEN=HUNTER-CHECKIN && run"})
+    finally:
+        fb._SECRETS.discard("HUNTER-CHECKIN")
+    check("the check-in line carries no secret", "HUNTER-CHECKIN" not in line, line[:200])
+    check("...and still names the tool and the time",
+          "`shell`" in line and "1m05s" in line, line[:200])
+
+
+def test_a_third_repeat_keeps_the_other_batch_lines():
+    """A-2026-10-08-159: the fold compared the FOLDED tail ("A (×2)") with the card's
+    signature, so the third identical call fell into the standalone branch and reset the
+    batch to the folded card alone - every other line the operator was reading vanished
+    (and the batch post was redrawn under the wrong ref)."""
+    d, rep = reporter(checkin_tool_merge_seconds=60)
+    rep.tool_done("shell", {"command": "step-B"}, "exit_code=0", 0.2)
+    for _ in range(3):
+        rep.tool_done("shell", {"command": "step-A"}, "exit_code=0", 0.2)
+    final = d.edits[-1][2]
+    check("the repeat count reaches x3", "×3" in final, final)
+    check("...and the other batch line is still on screen", "step-B" in final, final)
+
+
+def test_switches_silence_everything():
+    d, rep = reporter(checkin_per_tool=False, checkin_notes=False)
+    rep.tool_done("shell", {"command": "x"}, "exit_code=0", 1.0)
+    rep.note("narrating anyway")
+    check("both channels off -> silence", not d.posts and not d.edits, (d.posts, d.edits))
+    d, rep = reporter(progress_updates=False)
+    rep.tool_done("shell", {"command": "x"}, "exit_code=0", 1.0)
+    rep.note("narrating anyway")
+    check("progress_updates off -> silence too",
+          not d.posts and not d.edits, (d.posts, d.edits))
+
+
+# wiring: run() hands both callbacks what they need
+def scripted_run(seq, **cfg):
+    """Drive Agent.run against a scripted _chat, recording both callbacks."""
+    redirect_files()
+    fb.AGENT.histories.clear()
+    fb.AGENT.model_overrides.clear()
+    fb.AGENT.last_usage.clear()
+    saved_chat = fb.AGENT._chat
+    saved_cfg = copy.deepcopy(fb.CONFIG["agent"])
+    # These scenarios script a SHORT conversation and pin "exactly one nudge"; the
+    # no-progress budget (agent.nudge_retries, default 3) is graded by test_stall.py,
+    # so it is pinned to ONE here unless the scenario overrides it.
+    fb.CONFIG["agent"]["nudge_retries"] = 1
+    fb.CONFIG["agent"].update(cfg)
+    seq = list(seq)
+    events = []
+
+    def fake_chat(messages, model=None, use_tools=True, usage=None, max_tokens=None,
+                  cancel_event=None, on_delta=None, session_key=None):
+        return seq.pop(0)
+
+    fb.AGENT._chat = fake_chat
+    try:
+        out = fb.AGENT.run(
+            "checkin-session", "check the box",
+            interim_cb=lambda t: events.append(("note", t)),
+            progress_done_cb=lambda n, a, o, e: events.append(
+                ("tool", n, round(e, 3), str(o)[:60])))
+    finally:
+        fb.AGENT._chat = saved_chat
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved_cfg)
+    return out, events
+
+
+def test_run_announces_narration_before_tools():
+    out, events = scripted_run([
+        {"role": "assistant", "content": "Checking what holds the lock:",
+         "tool_calls": [{"id": "1", "function": {
+             "name": "shell",
+             "arguments": json.dumps({"command": "echo checkin-probe"})}}]},
+        {"role": "assistant", "content": "Nothing holds it."},
+    ])
+    check("narration arrives", ("note", "Checking what holds the lock:") in events, events)
+    check("narration precedes the tool it introduces",
+          events and events[0][0] == "note", events)
+    tool_events = [e for e in events if e[0] == "tool"]
+    check("each finished tool is reported once", len(tool_events) == 1, events)
+    check("the tool event carries name + duration + output",
+          tool_events[0][1] == "shell" and tool_events[0][2] >= 0
+          and "checkin-probe" in tool_events[0][3], tool_events)
+    check("the run still returns its answer", out == "Nothing holds it.", out)
+
+
+def test_a_zero_step_run_never_reads_as_work_done():
+    """    "Done - 0 step(s)" line while its reply only described work that had not started, on
+    two hosts. The line has to carry the fact, so a report can never be read as work.
+    """
+    d, rep = reporter()
+    rep.finish()
+    check("a 0-step done line says the run used no tool",
+          "no tool was used" in str(d.edits[-1][2]), d.edits[-3:])
+    d2, rep2 = reporter()
+    rep2.progress("shell", {"command": "ls"})
+    rep2.finish()
+    check("a run that did work keeps its plain done line",
+          "no tool was used" not in str(d2.edits[-1][2]), d2.edits[-3:])
+
+
+def test_run_silent_without_narration():
+    out, events = scripted_run([
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "1", "function": {
+             "name": "shell",
+             "arguments": json.dumps({"command": "echo quiet"})}}]},
+        {"role": "assistant", "content": "Done."},
+    ])
+    check("no prose -> no note event", not [e for e in events if e[0] == "note"], events)
+    check("the tool line still fires (model-independent)",
+          [e for e in events if e[0] == "tool"], events)
+    check("answer intact", out == "Done.", out)
+
+
+def test_run_works_without_the_new_callbacks():
+    """Default kwargs must stay optional — a caller may pass neither."""
+    redirect_files()
+    fb.AGENT.histories.clear()
+    saved_chat = fb.AGENT._chat
+    seq = [{"role": "assistant", "content": "All good."}]
+    fb.AGENT._chat = lambda messages, model=None, use_tools=True, usage=None, \
+        max_tokens=None, cancel_event=None, on_delta=None, session_key=None: seq.pop(0)
+    try:
+        out = fb.AGENT.run("callbacks-off", "say hi")
+    finally:
+        fb.AGENT._chat = saved_chat
+    check("run() still works with no callbacks", out == "All good.", out)
+
+
+# -------------------------------- v2.0.1: an empty turn is asked once more
+
+def scripted_run_with_usage(seq, session="empty-turn"):
+    """Drive Agent.run against a scripted _chat that fills `usage` the way the
+    real one does (finish_reason + last_reasoning_chars). Returns (out, seen),
+    where `seen` is the messages list of every call, shallow-copied."""
+    redirect_files()
+    fb.AGENT.histories.clear()
+    fb.AGENT.model_overrides.clear()
+    fb.AGENT.last_usage.clear()
+    saved_chat = fb.AGENT._chat
+    saved_cfg = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"]["nudge_retries"] = 1     # one ask, as above
+    replies = list(seq)
+    seen = []
+
+    def fake_chat(messages, model=None, use_tools=True, usage=None, max_tokens=None,
+                  cancel_event=None, on_delta=None, session_key=None):
+        seen.append([dict(m) for m in messages])
+        reply = replies.pop(0)
+        if isinstance(usage, dict):
+            rc = reply.get("reasoning_content") or ""
+            usage["calls"] = usage.get("calls", 0) + 1
+            usage["finish_reason"] = reply.get("finish_reason") or "stop"
+            usage["last_reasoning_chars"] = len(rc)
+        return {k: v for k, v in reply.items() if k != "finish_reason"}
+
+    fb.AGENT._chat = fake_chat
+    try:
+        out = fb.AGENT.run(session, "carry on with the job")
+    finally:
+        fb.AGENT._chat = saved_chat
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved_cfg)
+    return out, seen
+
+
+def test_empty_turn_is_retried_and_the_run_continues():
+    """A reasoning model that ends its own turn with no answer (finish=stop) used
+    to stop the run dead: the operator got a warning and had to prompt again.
+    Asking the same turn one more time is one call, and keeps the work moving."""
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": "", "reasoning_content": "Hmm, let me"},
+        {"role": "assistant", "content": "Next I read the second log."},
+    ])
+    check("empty turn: the run does not end on the empty answer",
+          out == "Next I read the second log.", out)
+    check("empty turn: the model was asked again (2 calls)", len(seen) == 2, len(seen))
+    if len(seen) == 2:
+        check("empty turn: the empty assistant turn is dropped before the retry",
+              all(not (m.get("role") == "assistant" and not m.get("content")
+                       and not m.get("tool_calls")) for m in seen[1]), seen[1])
+        check("empty turn: the retry ends with a plain user nudge",
+              seen[1][-1].get("role") == "user"
+              and "EMPTY" in str(seen[1][-1].get("content")), seen[1][-1])
+
+
+def test_two_empty_turns_end_the_run_with_honest_text():
+    """One retry, then tell the operator. A machine that answers nothing twice is
+    not going to answer on the third try, and retrying forever burns the clock."""
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": "", "reasoning_content": "Hmm, let me"},
+        {"role": "assistant", "content": "", "reasoning_content": "Hmm again"},
+    ])
+    check("two empty turns: exactly one retry", len(seen) == 2, len(seen))
+    check("two empty turns: the warning comes back",
+          "No answer" in out and "degenerate" in out, out)
+    check("two empty turns: it says it asked twice", "twice" in out, out)
+    check("two empty turns: it does not send the operator to llm.no_think",
+          "set llm.no_think: true" not in out, out)
+
+
+
+def test_a_cut_turn_with_no_answer_is_asked_again():
+    """finish=length with the reasoning spent and nothing said is a CUT, not a
+    refusal: the run gets another turn in the same task instead of ending on the
+    harness's own note (2026-09-21: a run was cut off mid-think at 08:06 and the
+    conversation sat dead until the operator posted again four hours later)."""
+    cut = {"role": "assistant", "content": "", "reasoning_content": "x" * 900,
+           "finish_reason": "length"}
+    out, seen = scripted_run_with_usage([
+        dict(cut), dict(cut),
+        {"role": "assistant", "content": "Back on it: the window moved.",
+         "finish_reason": "stop"},
+    ])
+    check("a cut turn is asked again after the empty retry", len(seen) == 3,
+          len(seen))
+    check("the run does not end on the harness note",
+          out.startswith("Back on it"), out)
+    if len(seen) == 3:
+        check("the re-ask names the silence",
+              seen[2][-1].get("role") == "user"
+              and "NO answer" in str(seen[2][-1].get("content")), seen[2][-1])
+    out2, seen2 = scripted_run_with_usage([dict(cut), dict(cut), dict(cut)])
+    check("the re-ask is bounded and then it reports honestly",
+          len(seen2) == 3 and "No answer" in out2, (len(seen2), out2[:80]))
+
+
+# ------------------------------------------- v1.9.29: streamed narration
+
+def test_streamed_narration_posts_once_and_grows():
+    """The whole point: ONE post that grows while the model writes, instead of one
+    lump per call after it returns."""
+    d = FakeDispatcher()
+    rep = fb.ProgressReporter(d, "chan", "root", "sess")
+    saved = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"].update(progress_updates=True, checkin_notes=True,
+                              checkin_stream_notes=True, checkin_stream_seconds=0.0)
+    try:
+        rep.narration("I will check the lock")
+        rep.narration("I will check the lock, then restart the service")
+        rep.narration("I will check the lock, then restart the service, then verify it")
+        # the reporter posts its status line in __init__, so filter for the 💬 post
+        notes = [p for p in d.posts if p[2].startswith("💬 ")]
+        check("streamed narration: one post, not one per delta", len(notes) == 1, d.posts)
+        check("streamed narration: the post is the 💬 line", bool(notes), d.posts)
+        check("streamed narration: later text EDITS that post",
+              len(d.edits) == 2 and len({e[0] for e in d.edits}) == 1
+              and all(e[2].startswith("💬 ") for e in d.edits), d.edits)
+        check("streamed narration: the post shows the latest text",
+              "verify it" in d.edits[-1][2], d.edits[-1][2])
+    finally:
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved)
+
+
+def test_streamed_narration_respects_its_gap_but_final_always_lands():
+    d = FakeDispatcher()
+    rep = fb.ProgressReporter(d, "chan", "root", "sess")
+    saved = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"].update(progress_updates=True, checkin_notes=True,
+                              checkin_stream_notes=True, checkin_stream_seconds=30.0)
+    try:
+        rep.narration("first")
+        rep.narration("first and second")
+        check("streamed narration: edits inside the gap are skipped",
+              not d.edits, d.edits)
+        rep.narration("first and second and third", final=True)
+        check("streamed narration: the final state is always written",
+              len(d.edits) == 1 and "third" in d.edits[-1][2], d.edits)
+    finally:
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved)
+
+
+def test_streamed_narration_is_dropped_when_it_was_the_answer():
+    d = FakeDispatcher()
+    rep = fb.ProgressReporter(d, "chan", "root", "sess")
+    saved = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"].update(progress_updates=True, checkin_notes=True,
+                              checkin_stream_notes=True, checkin_stream_seconds=0.0)
+    try:
+        rep.narration("Here is the answer, being written out")
+        check("a streamed draft exists", rep.narration_live() is True, rep.narration_live())
+        posted = len(d.posts)
+        rep.narration_drop()
+        # The Mattermost door never deletes: delete_post leaves a "(message deleted)"
+        # tombstone, so the draft is parked and the run's next line edits it in place
+        # (the destination-level test is test_stall's
+        # test_a_streamed_draft_belongs_to_the_run_that_streamed_it).
+        check("the draft is parked for the answer, never tombstoned",
+              not d.deletes and len(d.posts) == posted, (d.deletes, d.posts))
+        check("the reporter forgets it", rep.narration_live() is False, rep.narration_live())
+        rep.narration_drop()          # idempotent: nothing left to park
+        check("dropping twice changes nothing", not d.deletes, d.deletes)
+    finally:
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved)
+
+
+def test_streamed_narration_can_be_switched_off():
+    d = FakeDispatcher()
+    rep = fb.ProgressReporter(d, "chan", "root", "sess")
+    saved = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"].update(progress_updates=True, checkin_notes=True,
+                              checkin_stream_notes=False)
+    try:
+        rep.narration("should not appear anywhere")
+        check("checkin_stream_notes=false posts nothing",
+              not [p for p in d.posts if p[2].startswith("💬 ")] and not d.edits,
+              (d.posts, d.edits))
+    finally:
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved)
+
+
+def test_run_does_not_double_post_a_streamed_line():
+    """The streamed narration IS the 💬 line: run() must not post it again via
+    interim_cb. And when the streamed text turns out to be the ANSWER (no tool
+    calls), the draft must be dropped instead of duplicating the answer."""
+    d = FakeDispatcher()
+    rep = fb.ProgressReporter(d, "chan", "root", "sess")
+    saved_chat = fb.AGENT._chat
+    saved_cfg = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"].update(progress_updates=True, checkin_notes=True,
+                              checkin_stream_notes=True, checkin_stream_seconds=0.0)
+    notes, dropped = [], []
+
+    def make_chat(reply_content, tool_calls=None):
+        def fake_chat(messages, model=None, use_tools=True, usage=None,
+                      max_tokens=None, cancel_event=None, on_delta=None,
+                      session_key=None):
+            if on_delta:
+                # what the SSE path does while the model writes
+                on_delta({"deltas": 1, "chars": len(reply_content), "content": reply_content,
+                          "ttft": 0.1, "tps": 10.0})
+                on_delta({"deltas": 2, "chars": len(reply_content) + 8,
+                          "content": reply_content + " and one more thing",
+                          "ttft": 0.1, "tps": 10.0, "final": True})
+            r = {"role": "assistant", "content": reply_content}
+            if tool_calls:
+                r["tool_calls"] = tool_calls
+            return r
+        return fake_chat
+
+    plan = [{"id": "c1", "function": {"name": "list_tools", "arguments": "{}"}}]
+    try:
+        fb.AGENT._chat = make_chat("I will list the tools first:", plan)
+        fb.AGENT.run("stream-notes", "do it", interim_cb=lambda t: notes.append(t),
+                     narration_cb=rep.narration, narration_drop_cb=rep.narration_drop,
+                     progress_cb=None)
+        notes_posts = [p for p in d.posts if p[2].startswith("💬 ")]
+        check("streamed plan: the narration was streamed",
+              len(notes_posts) == 1
+              and notes_posts[0][2].startswith("💬 I will list the tools"), d.posts)
+        check("streamed plan: interim_cb did NOT post it a second time",
+              not notes, notes)
+        check("streamed plan: the draft is kept (it was the plan)",
+              rep.narration_live() is True, rep.narration_live())
+        check("streamed plan: no delete happened",
+              not d.deletes, d.deletes)
+
+        d.posts.clear(); d.edits.clear(); d.deletes.clear(); notes.clear()
+        fb.AGENT._chat = make_chat("The answer, written out live.")
+        fb.AGENT.run("stream-answer", "do it", interim_cb=lambda t: notes.append(t),
+                     narration_cb=rep.narration, narration_drop_cb=rep.narration_drop,
+                     progress_cb=None)
+        check("streamed answer: the draft was neither tombstoned nor duplicated",
+              not d.deletes and len(d.posts) == 1, (d.deletes, d.posts))
+        check("streamed answer: nothing was left live",
+              rep.narration_live() is False, rep.narration_live())
+        check("streamed answer: interim_cb was not used either", not notes, notes)
+    finally:
+        fb.AGENT._chat = saved_chat
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved_cfg)
+
+
+
+def test_each_turn_opens_its_own_narration_post():
+    """A multi-step run must read as a SEQUENCE. The first live test reused one post, so
+    every step replaced the previous step's text - visible in the chat as one line whose
+    content kept changing, and useless for reading the plan."""
+    d = FakeDispatcher()
+    rep = fb.ProgressReporter(d, "chan", "root", "sess")
+    saved = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"].update(progress_updates=True, checkin_notes=True,
+                              checkin_stream_notes=True, checkin_stream_seconds=0.0)
+    try:
+        rep.narration("Step one: check the date", new_turn=True)
+        rep.narration("Step one: check the date, then the free space", final=True)
+        rep.narration("Step two: list the tinycmdr folder", new_turn=True)
+        rep.narration("Step two: list the tinycmdr folder", final=True)
+        notes = [p for p in d.posts if p[2].startswith("💬 ")]
+        check("a new turn opens a new post", len(notes) == 2, d.posts)
+        first_id = d.ids[d.posts.index(notes[0])]
+        first_edits = [e[2] for e in d.edits if e[0] == first_id]
+        check("the previous step's line is left complete",
+              first_edits and "free space" in first_edits[-1], first_edits)
+        check("the new post carries the new step", "Step two" in notes[1][2], notes[1][2])
+        check("edits stayed within their own post",
+              len({e[0] for e in d.edits}) == 1, d.edits)
+    finally:
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved)
+
+
+
+
+# --------------------------------------------- colour: telling the lines apart (v1.9.30)
+
+def test_every_line_says_what_it_is_by_colour():
+    """The operator's ask: the noise is now colour-differentiated rather than larger.
+    Green = the model narrating what it is about to do, red = a tool call that ran,
+    white = harness status / Done summary. Each role's bar is pinned by exact colour."""
+    d = FakeDispatcher()
+    saved = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"].update(progress_updates=True, checkin_notes=True,
+                              checkin_stream_notes=True, checkin_stream_seconds=0.0,
+                              checkin_per_tool=True, color_coded=True)
+    try:
+        rep = fb.ProgressReporter(d, "chan", "root", "sess")
+        check("the working line is barred red",
+              d.colors[0] == fb.COLOR_TOOL, d.colors)
+        rep.narration("checking what holds the lock:", new_turn=True)
+        check("narration is barred green",
+              d.colors[-1] == fb.COLOR_NARRATION, d.colors)
+        rep.narration("checking what holds the lock, and the port:", final=True)
+        check("a growing narration keeps its green on the edit",
+              d.edit_colors[-1] == fb.COLOR_NARRATION, d.edit_colors)
+        rep.tool_done("shell", {"command": "ls"}, "ok\n", 0.4)
+        check("a tool call is barred red", d.colors[-1] == fb.COLOR_TOOL, d.colors)
+        rep.finish()
+        check("Done turns the bar white",
+              d.edit_colors[-1] == fb.COLOR_STATUS, d.edit_colors)
+        check("nothing was posted without a colour that should have one",
+              None not in d.colors, d.colors)
+    finally:
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved)
+
+
+def test_color_off_posts_plain_text_again():
+    """The kill switch has to be complete: one config flag and the channel looks
+    exactly like pre-1.9.30, with no half-barred lines left behind."""
+    d = FakeDispatcher()
+    saved = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"].update(progress_updates=True, checkin_notes=True,
+                              checkin_stream_notes=True, checkin_stream_seconds=0.0,
+                              checkin_per_tool=True, color_coded=False)
+    try:
+        rep = fb.ProgressReporter(d, "chan", "root", "sess")
+        rep.narration("about to look", new_turn=True)
+        rep.tool_done("shell", {"command": "ls"}, "ok\n", 0.4)
+        rep.finish()
+        check("no post carries a colour", set(d.colors) == {None}, d.colors)
+        check("no edit carries a colour", set(d.edit_colors) == {None}, d.edit_colors)
+    finally:
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved)
+
+
+def test_a_reply_that_is_not_progress_stays_unbarred():
+    """Command replies and the final answer must stay plain: after a run of coloured
+    lines, an unbarred post is what says 'this is the payload, not more noise'."""
+    d = FakeDispatcher()
+    d._post("chan", None, "/version reply")
+    check("a plain post has no colour", d.colors == [None], d.colors)
+    check("and want_color(None) stays None", fb.want_color(None) is None, None)
+
+
+def test_the_bar_shape_is_exactly_what_mattermost_renders():
+    """The contract with the server: a post carries Slack-style attachments and the
+    colour lives on each attachment. Verified against the real server before this was
+    built, and pinned here so a refactor cannot quietly change the shape."""
+    props = fb.bar_props("💬 about to check the lock", fb.COLOR_NARRATION)
+    check("props shape", props == {"attachments": [
+        {"color": "#2ecc71", "text": "💬 about to check the lock"}]}, props)
+    check("the palette is the one the operator approved",
+          (fb.COLOR_NARRATION, fb.COLOR_TOOL, fb.COLOR_STATUS)
+          == ("#2ecc71", "#f1c40f", "#ffffff"),
+          (fb.COLOR_NARRATION, fb.COLOR_TOOL, fb.COLOR_STATUS))
+    check("red is reserved for failures",
+          fb.COLOR_FAIL == "#e74c3c", fb.COLOR_FAIL)
+
+
+
+
+def test_red_is_only_for_failures():
+    """Amber means a tool call ran; red is kept for the two cases where something is
+    actually wrong - a call that exited non-zero, and a run that ended badly - so a red
+    bar is never a false alarm."""
+    d = FakeDispatcher()
+    saved = copy.deepcopy(fb.CONFIG["agent"])
+    fb.CONFIG["agent"].update(progress_updates=True, checkin_notes=True,
+                              checkin_stream_notes=True, checkin_stream_seconds=0.0,
+                              checkin_per_tool=True, checkin_tool_merge_seconds=0.0,
+                              # cap 1: every call is its own post. Two calls in the same
+                              # clock tick would otherwise merge into one batch (Windows
+                              # time.time() granularity), which is real behaviour but not
+                              # what this test is pinning.
+                              checkin_tool_max_lines=1, color_coded=True)
+    try:
+        rep = fb.ProgressReporter(d, "chan", "root", "sess")
+        d.colors.clear()
+        rep.tool_done("shell", {"command": "ls"}, "fine\nexit_code=0", 0.3)
+        check("a tool call that ran is amber", d.colors[-1] == fb.COLOR_TOOL, d.colors)
+        rep.tool_done("shell", {"command": "false"}, "boom\nexit_code=1", 0.3)
+        check("a call that exited non-zero is red", d.colors[-1] == fb.COLOR_FAIL,
+              d.colors)
+
+        d.edit_colors.clear()
+        fb.ProgressReporter(d, "chan", "root", "sess").finish(ok=False)
+        check("a run that ended badly is red", d.edit_colors[-1] == fb.COLOR_FAIL,
+              d.edit_colors)
+        fb.ProgressReporter(d, "chan", "root", "sess").finish(ok=True)
+        check("a clean run's Done is white", d.edit_colors[-1] == fb.COLOR_STATUS,
+              d.edit_colors)
+    finally:
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved)
+
+
+def test_capability_line_reports_what_this_process_can_enforce():
+    """The honest state, said out loud.
+
+    A host's posture was implied - blocked_patterns set or empty, a memory ceiling or
+    none, a spawn backend or none - and it differs per host and per lane, so a reader of
+    the log could not tell them apart. It is read ONCE at start: this is for the operator,
+    never for the model, so it must stay out of the prompt.
+    """
+    line = fb.capability_line("mattermost")
+    check("capability: it is one line", "\n" not in line and "\r" not in line, line)
+    check("capability: names the lane", "lane mattermost" in line, line)
+    check("capability: names the model and the endpoint it goes to",
+          str(fb.CONFIG["llm"].get("model")) in line
+          and str(fb.CONFIG["llm"].get("base_url")) in line, line)
+    live = [p for p in (fb.CONFIG["agent"].get("blocked_patterns") or [])
+            if str(p).strip()]
+    check("capability: counts the live blocked patterns",
+          ("blocked_patterns %d " % len(live)) in line, line)
+    check("capability: states a ceiling, and its size when there is one",
+          "memory ceiling none" in line or "GiB (cgroup" in line, line)
+    check("capability: names the spawn backend",
+          "spawn backend CREATE_NO_WINDOW" in line
+          or "spawn backend inherited console" in line, line)
+
+    saved = fb.CONFIG["agent"].get("blocked_patterns")
+    try:
+        fb.CONFIG["agent"]["blocked_patterns"] = ["rm -rf /", "", "   ", "mkfs"]
+        edited = fb.capability_line("cli")
+        check("capability: blank patterns are not counted as enforcement",
+              "blocked_patterns 2 " in edited, edited)
+        check("capability: the lane is not hardcoded", "lane cli" in edited, edited)
+        fb.CONFIG["agent"]["blocked_patterns"] = []
+        check("capability: an empty list reads as 0, not as absent",
+              "blocked_patterns 0 " in fb.capability_line("cli"),
+              fb.capability_line("cli"))
+    finally:
+        fb.CONFIG["agent"]["blocked_patterns"] = saved
+
+
+# ------------- 1.0.3: a promise with no tool call is not an answer
+
+def test_a_promise_with_no_tool_call_is_asked_to_act_once():
+    """The model says it is about to work and stops there, with no tool call at all.
+
+    calls, every reply a promise ("I'll gather what we did in the MVT session, then
+    write and publish the post. Let me start by checking..."). The delivery guard only
+    counted announcements that arrive WITH calls queued, so the promise was posted as
+    the run's answer and the task never started. Asking once costs one call; not asking
+    leaves the operator with a bot that talks and never works.
+    """
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant",
+         "content": "I'll gather the logs, then write it up. Let me start by checking."},
+        {"role": "assistant", "content": "Collected 3 files."},
+    ])
+    # The delivered answer is the RETRY's, and the retry also made no tool call, so
+    # the evidence check rides with it - correct, and asserted rather than ignored.
+    check("promise: the run does not end on the promise",
+          out.startswith("Collected 3 files."), out)
+    check("promise: the retry's own numbers are marked unchecked",
+          "evidence check" in out, out)
+    check("promise: the model was asked to act (2 calls)", len(seen) == 2, len(seen))
+    if len(seen) == 2:
+        check("promise: the nudge says to make the call now",
+              "Make the first tool call NOW" in str(seen[1][-1].get("content")),
+              seen[1][-1])
+        check("promise: the promise turn is dropped before the retry",
+              all(not (m.get("role") == "assistant"
+                       and "gather the logs" in str(m.get("content")))
+                  for m in seen[1]), seen[1])
+        check("promise: the retry ends with a plain user nudge",
+              seen[1][-1].get("role") == "user", seen[1][-1])
+
+
+def test_a_second_promise_is_reported_not_asked_forever():
+    """One nudge, not a loop: a model that promises twice is answered with its own words
+    rather than a third call."""
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": "I'll gather the logs now."},
+        {"role": "assistant", "content": "Continuing - gathering the logs."},
+    ])
+    check("two promises: exactly one nudge (2 calls)", len(seen) == 2, len(seen))
+    check("two promises: the second one is delivered", "gathering the logs" in out, out)
+
+
+def test_a_plain_answer_is_not_nudged():
+    """The fence is 'the run made no tool call at all' PLUS a promise in the text: an
+    answer that needed no tool (a status line, a report, a question back) ends the run
+    exactly as it did before, or every chat reply would cost a second call."""
+    # No change-claim verb in the text: the evidence check appends its own note to a
+    # report that claims work, and this case is about the promise guard alone.
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": "Port 8787 answers with ok."},
+    ])
+    check("plain answer: exactly one call", len(seen) == 1, len(seen))
+    check("plain answer: delivered unchanged",
+          out == "Port 8787 answers with ok.", out)
+
+    out2, seen2 = scripted_run_with_usage([
+        {"role": "assistant", "content": "Should I delete the old folder first?"},
+    ])
+    check("a question back is not nudged", len(seen2) == 1, len(seen2))
+
+
+def test_a_report_after_real_work_is_never_nudged():
+    """calls > 0 is the fence for a REPORT: results that follow tool work are delivered
+    as written, never re-asked.
+
+    is only the PROMISE case after work, and it moved because live installs' own transcripts
+    showed it was where runs actually stop ("Let me find where." after real tool work,
+    with the operator's next message being "wait why didnt you download anything").
+    A report is an outcome; a promise is not, and only the second one is asked again.
+    """
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "1", "function": {
+             "name": "shell",
+             "arguments": json.dumps({"command": "echo promise-guard"})}}]},
+        {"role": "assistant",
+         "content": "Report: the echo returned promise-guard; nothing else was checked."},
+    ])
+    check("after work: no nudge was spent", len(seen) == 2, len(seen))
+    check("after work: the report is delivered",
+          "nothing else was checked" in out, out)
+
+
+def test_a_promise_after_real_work_gets_one_ask_then_the_report():
+    """The sibling: the same turn shape, but it promises instead of reporting."""
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "1", "function": {
+             "name": "shell",
+             "arguments": json.dumps({"command": "echo promise-guard"})}}]},
+        {"role": "assistant", "content": "I'll gather the rest in a moment."},
+        {"role": "assistant",
+         "content": "Gathered: the echo returned promise-guard, and nothing else exists."},
+    ])
+    check("promise after work: the model is asked once", len(seen) == 3, len(seen))
+    check("promise after work: the ask names the work already done",
+          "This run has already made 1 tool call(s)" in json.dumps(seen[-1]), seen[-1][-1])
+    check("promise after work: the run then delivers the report",
+          "nothing else exists" in out, out)
+
+
+
+# ------------- 1.0.8: a filled-in report with no tool call is not an answer
+
+# The live sample. One order each to Windows and macOS on 2026-09-24, 2 model
+# calls and 0 tool calls on both boxes, and this came back as the run's report - for a
+# directory neither box had created. The promise guard missed it (nothing is promised),
+# and the evidence check missed it too (nothing is changed): a measured value is neither.
+_FAKE_REPORT = ("Turn 1 - four calls in one batch.\n\nFILES: 5 4\nBATCH: 4 calls issued "
+                "in one message; they ran in parallel (harness returned all four "
+                "results in a single batch reply, not sequentially)\n"
+                "READBACK: alphagammabetadelta")
+
+
+def test_a_filled_in_report_with_no_tool_call_is_asked_to_check_once():
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": _FAKE_REPORT},
+        {"role": "assistant", "content": "alpha.txt is 5 bytes and beta.txt is 4."},
+    ])
+    # The retry also made no tool call, so the harness marks its numbers unchecked
+    # too: the fence is calls == 0, not the wording.
+    check("report: the run does not end on the fabricated report",
+          out.startswith("alpha.txt is 5 bytes and beta.txt is 4."), out)
+    check("report: the retry's own numbers are marked unchecked",
+          "evidence check" in out, out)
+    check("report: the model was asked to check (2 calls)", len(seen) == 2, len(seen))
+    if len(seen) == 2:
+        nudge = str(seen[1][-1].get("content"))
+        check("report: the nudge says to make the call now",
+              "Make the call NOW" in nudge, nudge)
+        check("report: the nudge asks only for what the call returns",
+              "report only what it actually returns" in nudge, nudge)
+        check("report: the fabricated turn is dropped before the retry",
+              all("READBACK: alphagammabetadelta" not in str(m.get("content"))
+                  for m in seen[1]), seen[1])
+        check("report: the retry ends with a plain user nudge",
+              seen[1][-1].get("role") == "user", seen[1][-1])
+
+
+def test_a_second_filled_in_report_is_delivered_not_asked_forever():
+    """One nudge, not a loop - the same bound the promise guard carries."""
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": "FILES: 5 4\nREADBACK: alphabeta"},
+        {"role": "assistant", "content": "FILES: 5 4\nREADBACK: alphabeta"},
+    ])
+    check("two reports: exactly one nudge (2 calls)", len(seen) == 2, len(seen))
+    check("two reports: the second one is delivered",
+          "READBACK: alphabeta" in out, out)
+
+
+def test_a_report_after_real_work_is_not_nudged_for_results():
+    """calls > 0 is the fence here as well: measured values in a report that followed
+    tool work are exactly what a report is supposed to contain."""
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "1", "function": {
+             "name": "shell",
+             "arguments": json.dumps({"command": "echo result-guard"})}}]},
+        {"role": "assistant", "content": "FILES: 5 4\nREADBACK: alphabeta"},
+    ])
+    check("after work: no nudge was spent", len(seen) == 2, len(seen))
+    check("after work: the report is delivered", "READBACK: alphabeta" in out, out)
+
+
+def test_neither_plain_prose_nor_a_question_is_nudged_for_results():
+    out, seen = scripted_run_with_usage([
+        {"role": "assistant", "content": "Nothing to do here."},
+    ])
+    check("plain prose: exactly one call", len(seen) == 1, len(seen))
+    check("plain prose: delivered unchanged", out == "Nothing to do here.", out)
+    # A question is a legitimate stop even when it quotes a number, which is why the
+    # fence is the trailing "?" and not the detector alone.
+    out2, seen2 = scripted_run_with_usage([
+        {"role": "assistant", "content": "Is 5 files the count you expected?"},
+    ])
+    check("a question back is not nudged for results", len(seen2) == 1, len(seen2))
+
+
+def test_the_result_claim_detector_fires_on_reports_and_stays_quiet_on_prose():
+    rx = fb._RESULT_CLAIM_RX
+    fires = [
+        _FAKE_REPORT,
+        "FILES: 5 4\nREADBACK: alphabeta",
+        "EXIT: 1",
+        "the file contains 3 lines.",
+        "I ran the command and it printed gamma.",
+        "hash 3cdacefd347ee4faaef210d185f3c671ff7bf21d372e5e4bab65e51771627d7a",
+        "the tool returned 12 items.",
+        # the review's own corpus: shapes that must keep matching
+        "b1.txt: 19 bytes",
+        "12 files in the folder",
+        "the log has 240 lines",
+    ]
+    for text in fires:
+        check("detector fires: %r" % text[:34], bool(rx.search(text)), text)
+    quiet = [
+        "Nothing to do here.",
+        "Port 8787 answers with ok.",
+        "I have no way to check that without a tool.",
+        "Should I delete the old folder first?",
+        "both files are written.",
+        # regress-audit.py over every fleet bot's DELIVERED answers found this
+        # one on macOS: a true-from-memory answer in a run with no tool
+        # call. A bare machine spec is not a claim about anything fetched, so
+        # the measurement branch needs box-ish context beside the number.
+        "16 GB unified memory.",
+        "The box has 8 GB of RAM.",
+        "That took 40 seconds.",
+        "MVT analysis complete on the decrypted backup. Here's the full "
+        "report:",
+    ]
+    for text in quiet:
+        check("detector stays quiet: %r" % text[:34], not rx.search(text), text)
+
+
+def test_the_payload_carries_the_warning_only_after_a_wreck():
+    """Placement matters: the line rides the trailing state block, so the operator's
+    request still lands LAST in the payload (the 2026-09-10 rule).
+
+    Called on _payload directly: scripted_run_with_usage clears the histories it is given,
+    so seeding the session's transcript has to happen where nothing clears it.
+    """
+    redirect_files()
+    request = [{"role": "user", "content": "report the byte size of the config file"}]
+    fb.AGENT.histories["wreck"] = [
+        {"role": "assistant",
+         "content": "\U0001f501 Stopped a loop: `task` repeated 6 times"}]
+    out = fb.AGENT._payload(list(request), session_key="wreck")
+    body = "\n".join(str(m.get("content") or "") for m in out)
+    check("wreck: the payload carries the warning", "did not finish" in body, body[-300:])
+    check("wreck: the operator request is still last",
+          out[-1].get("content") == request[0]["content"], out[-1])
+    check("wreck: the warning rides the block, not the request",
+          "did not finish" not in str(out[-1].get("content") or ""), out[-1])
+    fb.AGENT.histories["clean-session"] = [
+        {"role": "assistant", "content": "Ledger holds 3 open items."}]
+    out2 = fb.AGENT._payload(list(request), session_key="clean-session")
+    body2 = "\n".join(str(m.get("content") or "") for m in out2)
+    check("clean session: no warning line", "did not finish" not in body2, body2[-200:])
+
+
+# the copy-paste repeat problem (macOS, 2026-09-24)
+# One stuck run posted the same sentence EIGHT times in three minutes: eight
+# narration lines that all opened "The video is already downloaded (9.2 MB ..."
+# and differed only after that, every one of them a notification. The guard that
+# existed compared the whole line, so none of them matched. These pin the fold -
+# and, just as important, that it does NOT swallow lines that differ: a first cut
+# of this fix compared the opening six words with digits stripped, made `step-0`
+# and `step-1` the same line, and dropped one of them from the operator's view.
+
+def test_a_restated_note_updates_its_line_and_a_new_note_still_posts():
+    d, rep = reporter(checkin_note_min_seconds=0)
+    rep.note("Checking the chat lane for the file I already downloaded (9.2 MB)")
+    check("the first note posts", len(d.posts) == 1, d.posts)
+    rep.note("Checking the chat lane for the file I already downloaded, 9.2 MB, unchanged")
+    check("a restated note is not posted again", len(d.posts) == 1, d.posts)
+    check("it updates the line on screen instead",
+          bool(d.edits) and d.edits[-1][0] == d.ids[0], d.edits)
+    check("and the newest wording is what the line says",
+          "unchanged" in d.edits[-1][2], d.edits[-1][2] if d.edits else None)
+    check("the repeat was counted", rep.note_repeats.get(rep.src) == 1, rep.note_repeats)
+    rep.note("Now checking how much disk space is left")
+    check("a different note still posts", len(d.posts) == 2, d.posts)
+
+
+def test_a_restated_narration_does_not_open_a_new_line():
+    """The measured shape: eight lines opening "The video is already downloaded
+    (9.2 MB ..." and differing only after that."""
+    d, rep = reporter(checkin_stream_seconds=0)
+    rep.narration("The video is already downloaded (9.2 MB at /tmp/download/x.mp4)",
+                  final=False, new_turn=True)
+    check("the first status opens a line", len(d.posts) == 1, d.posts)
+    rep.narration("The video is already downloaded (9.2 MB, from an earlier run)",
+                  final=False, new_turn=True)
+    check("a restated turn does not post a second line", len(d.posts) == 1, d.posts)
+    check("it updates the line already there",
+          bool(d.edits) and d.edits[-1][0] == d.ids[0], d.edits)
+    check("the repeat was counted", rep.stream_repeats.get(rep.src) == 1, rep.stream_repeats)
+    rep.narration("Listing the tools this lane offers", final=False, new_turn=True)
+    check("a genuinely new status opens a new line", len(d.posts) == 2, d.posts)
+
+
+def test_a_restatement_inside_the_gap_still_updates_the_line():
+    """A-280 (2026-10-06): the note rate-limit ran BEFORE the restatement fold, so
+    a reworded restatement inside checkin_note_min_seconds was dropped outright and
+    the line kept the OLDER wording - the opposite of the fold's promise that the
+    newest wording is what the operator reads."""
+    d, rep = reporter(checkin_note_min_seconds=60)
+    rep.note("Checking the chat lane for the file (9.2 MB)")
+    check("the first note posts", len(d.posts) == 1, d.posts)
+    rep.note("Checking the chat lane for the file (9.2 MB, unchanged)")
+    check("a restatement inside the gap still updates the line it restates",
+          bool(d.edits) and "unchanged" in d.edits[-1][2], d.edits)
+    check("...and posts nothing new", len(d.posts) == 1, d.posts)
+
+
+def test_a_restated_narration_inside_the_gap_still_updates_its_line():
+    """A-280's streamed twin: narration() ran the same gap check before its fold."""
+    d, rep = reporter(checkin_stream_seconds=60)
+    rep.narration("The video is already downloaded (9.2 MB at /tmp/download/x.mp4)",
+                  final=False, new_turn=True)
+    check("the first status opens a line", len(d.posts) == 1, d.posts)
+    rep.narration("The video is already downloaded (9.2 MB, from an earlier run)",
+                  final=False, new_turn=True)
+    check("a restatement inside the gap updates the line",
+          bool(d.edits) and "earlier run" in d.edits[-1][2], d.edits)
+    check("...and posts nothing new", len(d.posts) == 1, d.posts)
+    rep.narration("Now checking how much disk space is left", final=False,
+                  new_turn=False)
+    check("a genuinely different status inside the gap is still throttled",
+          len(d.edits) == 1 and len(d.posts) == 1, (d.posts, d.edits))
+
+
+def test_a_repeated_card_folds_into_one_card_with_a_count():
+    d, rep = reporter(checkin_tool_merge_seconds=0)
+    rep.tool_done("shell", {"command": "ls -la"}, "exit_code=0", 0.2)
+    rep.tool_done("shell", {"command": "ls -la"}, "exit_code=0", 0.3)
+    check("the same card twice is ONE card", len(d.posts) == 1, d.posts)
+    check("the card that stayed says how many it absorbed",
+          "(×2)" in (d.edits[-1][2] if d.edits else ""), d.edits)
+
+
+def test_two_different_calls_are_never_folded_into_one():
+    """The regression that stopped the first draft: folding on the opening words
+    with digits removed made `step-0` and `step-1` one line, and the operator lost
+    the list of what actually ran."""
+    d, rep = reporter(checkin_tool_merge_seconds=60, checkin_tool_max_lines=2)
+    for i in range(3):
+        rep.tool_done("shell", {"command": f"step-{i}"}, "exit_code=0", 0.2)
+    body = "\n".join(x[2] for x in d.posts) + "\n".join(x[2] for x in d.edits)
+    check("every call is on the surface", all(f"step-{i}" in body for i in range(3)), body)
+    check("the cap still forces a second message", len(d.posts) == 2, d.posts)
+
+def test_a_mid_run_infra_failure_does_not_claim_nothing_changed():
+    """The infra-failure answer must not say "nothing was changed" over real work.
+
+    Measured 2026-10-10 driving the stage: the endpoint went down mid-run after the run
+    had already minted a tool and written files, and the operator-facing answer read
+    "The task did not run; nothing was changed." With completed calls the answer has to
+    say they stand.
+    """
+    redirect_files()
+    fb.AGENT.histories.clear()
+    fb.AGENT.model_overrides.clear()
+    fb.AGENT.last_usage.clear()
+    saved_chat = fb.AGENT._chat
+    saved_cfg = copy.deepcopy(fb.CONFIG["agent"])
+    seen = {"n": 0}
+
+    def fake_chat(messages, model=None, use_tools=True, usage=None, max_tokens=None,
+                  cancel_event=None, on_delta=None, session_key=None):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return {"role": "assistant", "content": "Probing.",
+                    "tool_calls": [{"id": "1", "function": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "echo infra-probe"})}}]}
+        raise fb.InfraError("endpoint died on the wire")
+
+    fb.AGENT._chat = fake_chat
+    try:
+        out = fb.AGENT.run("infra-mid", "do the probe",
+                           interim_cb=lambda t: None,
+                           progress_done_cb=lambda *a: None)
+    finally:
+        fb.AGENT._chat = saved_chat
+        fb.CONFIG["agent"].clear()
+        fb.CONFIG["agent"].update(saved_cfg)
+    check("the mid-run failure names the calls that stand",
+          "mid-flight" in out and "STANDS" in out and "nothing was changed" not in out,
+          out[:240])
+
+
+def main():
+    tests = [v for k, v in sorted(globals().items())
+             if k.startswith("test_") and callable(v)]
+    only = sys.argv[1] if len(sys.argv) > 1 else ""
+    for t in tests:
+        if only and only not in t.__name__:
+            continue
+        try:
+            t()
+        except Exception as e:
+            import traceback
+            FAILURES.append(f"{t.__name__} raised: {e}")
+            traceback.print_exc()
+    print(f"\n{len(PASSES)} passed, {len(FAILURES)} failed")
+    for f in FAILURES:
+        print("  FAIL:", f)
+    return 1 if FAILURES else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
