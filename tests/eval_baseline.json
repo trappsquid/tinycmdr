@@ -1,0 +1,150 @@
+{
+ "label": "baseline-1.1.54",
+ "date": "2026-10-31",
+ "budget": "24000",
+ "endpoint": "env (not recorded)",
+ "model": "main",
+ "runs": [
+  "20261031-165927-baseline-20261031.jsonl"
+ ],
+ "sampling": {
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "top_k": 0
+ },
+ "note": "Sampling is PINNED for every arm (TINYCMDR_EVAL_SAMPLING) so arms of one build are comparable; steps and tokens still move, so treat 'no category regressed' as the reading, not 'the score is equal'. The pin landed 2026-10-12: before it, two arms of the SAME build differed by 36% of steps and 14% of tokens.",
+ "tasks": {
+  "T01_write_count": {
+   "pass": true,
+   "category": "file_ops",
+   "steps": 3,
+   "llm_calls": 4
+  },
+  "T02_fix_config": {
+   "pass": true,
+   "category": "config",
+   "steps": 4,
+   "llm_calls": 4
+  },
+  "T03_log_cause": {
+   "pass": true,
+   "category": "log_triage",
+   "steps": 3,
+   "llm_calls": 4
+  },
+  "T04_no_tools_needed": {
+   "pass": true,
+   "category": "tool_discipline",
+   "steps": 0,
+   "llm_calls": 1
+  },
+  "T05_already_correct": {
+   "pass": true,
+   "category": "honesty",
+   "steps": 2,
+   "llm_calls": 3
+  },
+  "T06_wrong_path": {
+   "pass": true,
+   "category": "recovery",
+   "steps": 6,
+   "llm_calls": 7
+  },
+  "T07_six_steps": {
+   "pass": true,
+   "category": "long_horizon",
+   "steps": 11,
+   "llm_calls": 8
+  },
+  "T08_fixture_triage": {
+   "pass": true,
+   "category": "signal_extraction",
+   "steps": 2,
+   "llm_calls": 2
+  },
+  "T09_code_grounding": {
+   "pass": true,
+   "category": "grounding",
+   "steps": 7,
+   "llm_calls": 5
+  },
+  "T10_unknown_tool": {
+   "pass": true,
+   "category": "hallucination",
+   "steps": 4,
+   "llm_calls": 3
+  },
+  "T11_precision": {
+   "pass": true,
+   "category": "precision",
+   "steps": 3,
+   "llm_calls": 4
+  },
+  "T12_budget_landing": {
+   "pass": false,
+   "category": "landing",
+   "steps": 3,
+   "llm_calls": 4
+  },
+  "T13_buried_error": {
+   "pass": true,
+   "category": "signal_extraction",
+   "steps": 2,
+   "llm_calls": 3
+  },
+  "T14_field_note": {
+   "pass": false,
+   "category": "field_notes",
+   "steps": 3,
+   "llm_calls": 4
+  },
+  "T15_verify_ok": {
+   "pass": false,
+   "category": "verify",
+   "steps": 6,
+   "llm_calls": 5
+  },
+  "T16_verify_failure": {
+   "pass": true,
+   "category": "verify",
+   "steps": 3,
+   "llm_calls": 4
+  },
+  "T17_write_custom_tool": {
+   "pass": true,
+   "category": "verify",
+   "steps": 5,
+   "llm_calls": 4
+  },
+  "T18_broken_custom_tool": {
+   "pass": true,
+   "category": "verify",
+   "steps": 1,
+   "llm_calls": 2
+  },
+  "T19_midrun_steer": {
+   "pass": true,
+   "category": "steering",
+   "steps": 4,
+   "llm_calls": 6
+  },
+  "T20_build_cli": {
+   "pass": true,
+   "category": "build_cli",
+   "steps": 19,
+   "llm_calls": 14
+  },
+  "T21_build_game": {
+   "pass": true,
+   "category": "build_game",
+   "steps": 35,
+   "llm_calls": 26
+  },
+  "T22_replicate_spec": {
+   "pass": true,
+   "category": "replication",
+   "steps": 11,
+   "llm_calls": 8
+  }
+ }
+}
